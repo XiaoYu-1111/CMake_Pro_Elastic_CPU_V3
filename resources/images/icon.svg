@@ -1,0 +1,18 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- 背景 -->
+  <rect x="0" y="0" width="512" height="512" rx="110" ry="110" fill="#202025" />
+  
+  <!-- 地层线条 -->
+  <path d="M 64 350 Q 256 300 448 350" stroke="#555" stroke-width="8" fill="none" />
+  <path d="M 64 420 Q 256 370 448 420" stroke="#555" stroke-width="8" fill="none" />
+  
+  <!-- 垂直地震道 (Wiggle Trace) -->
+  <path d="M 128 100 L 128 450 M 128 150 L 148 160 L 128 170 M 128 250 L 108 260 L 128 270" stroke="#00d4aa" stroke-width="6" fill="none" />
+  <path d="M 256 100 L 256 450 M 256 180 L 286 190 L 256 200 M 256 280 L 226 290 L 256 300" stroke="#00d4aa" stroke-width="6" fill="none" />
+  <path d="M 384 100 L 384 450 M 384 150 L 404 160 L 384 170 M 384 250 L 364 260 L 384 270" stroke="#00d4aa" stroke-width="6" fill="none" />
+
+  <!-- 检波器图标 (倒三角) -->
+  <polygon points="118,80 138,80 128,100" fill="#ffaa00" />
+  <polygon points="246,80 266,80 256,100" fill="#ffaa00" />
+  <polygon points="374,80 394,80 384,100" fill="#ffaa00" />
+</svg>

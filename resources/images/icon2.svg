@@ -1,0 +1,35 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="waveGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00f2ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0078ff;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4.5" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  
+  <!-- 背景容器 -->
+  <rect x="0" y="0" width="512" height="512" rx="120" ry="120" fill="#1a1a1e" />
+  
+  <!-- 背景网格 (示意 FDTD) -->
+  <path d="M 64 256 H 448 M 256 64 V 448" stroke="#333" stroke-width="4" />
+  <circle cx="256" cy="256" r="180" stroke="#333" stroke-width="2" fill="none" opacity="0.3" />
+  
+  <!-- 声波涟漪 -->
+  <g filter="url(#glow)">
+    <!-- 外圈 -->
+    <circle cx="256" cy="256" r="140" stroke="url(#waveGrad)" stroke-width="16" fill="none" opacity="0.4" />
+    <!-- 中圈 -->
+    <circle cx="256" cy="256" r="90" stroke="url(#waveGrad)" stroke-width="18" fill="none" opacity="0.7" />
+    <!-- 内圈 -->
+    <circle cx="256" cy="256" r="45" stroke="url(#waveGrad)" stroke-width="20" fill="none" />
+  </g>
+  
+  <!-- 核心震源 -->
+  <circle cx="256" cy="256" r="15" fill="#ffffff" />
+</svg>

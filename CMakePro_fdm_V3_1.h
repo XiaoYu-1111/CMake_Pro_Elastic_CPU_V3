@@ -1,0 +1,1363 @@
+﻿
+#define NOMINMAX                 // 禁用Windows的min/max宏
+
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION // 启用写入实现
+#include "stb_image_write.h"
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+
+#include <windows.h>
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <algorithm>
+#include <list>
+#include <omp.h> 
+#include <string>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <random>
+#include <chrono>
+#include <thread>
+#include <array> // 别忘了在文件顶部包含这个头文件
+
+// ==========================================
+// 1. 核心参数与全局定义
+// ==========================================
+using Real = float;
+const int INITIAL_WINDOW_WIDTH = 1000;
+const int INITIAL_WINDOW_HEIGHT = 1000;
+const int GRID_W =500;
+const int GRID_H =500;
+const Real DX = 1.0f;
+const Real DT = 0.0001f;
+const int DAMP_WIDTH = 50;
+const Real PI = 3.1415926535f;
+
+// 全局控制开关
+bool show_recorder_window = false;
+bool show_recorders_window = false;
+bool SwapInterval = true;
+std::string exe_dir;
+float wetness = 0.5;
+
+bool triggerScreenshot = false;
+// --- 截图提示相关 ---
+std::string lastSavedPath = "";   // 保存最后一次截图的完整路径
+double saveMsgStartTime = -10.0;  // 提示框开始显示的时间 (负数表示不显示)
+const double SAVE_MSG_DURATION = 5.0; // 提示框显示几秒
+
+// 视口与坐标结构
+struct ViewportInfo {
+    int x, y, w, h;
+    int screenX, screenY;
+    float scaleX, scaleY;
+};
+
+// 工具模式枚举
+enum class ToolMode {
+    TRIGGER_SOURCE = 0, DRAW_HIGH_VEL = 1, DRAW_LOW_VEL = 2,
+    DRAW_WALL = 3, ERASE = 4, PLACE_ARRAY = 5
+};
+
+// 渲染模式枚举
+enum class RenderMode {
+    LIQUID = 0, HEATMAP = 1, MODEL = 2, COOLWARM = 3, CUSTOM = 4, JET = 5,
+    Black_White = 6, Liquid_Glass = 7, Ceramic_Effect = 8, White_Porcelain = 9,
+    Clay_Terracotta = 10, liquid_mercury = 11, Water = 12, Clay_wetness = 13, 
+    Coolwarm_Metallic = 14
+};
+
+// 全局交互变量
+int arrayReceiverCount = 20;
+bool isDraggingArray = false;
+int dragStartX, dragStartY;
+
+// ==========================================
+// 2. Shader 工具函数
+// ==========================================
+std::string loadShaderFromFile(const std::string& filePath) {
+    std::ifstream shaderFile;
+    shaderFile.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    try {
+        shaderFile.open(filePath);
+        std::stringstream shaderStream;
+        shaderStream << shaderFile.rdbuf();
+        shaderFile.close();
+        return shaderStream.str();
+    }
+    catch (std::ifstream::failure& e) {
+        std::cerr << "ERROR::SHADER::READ_FAIL: " << filePath << std::endl;
+        return "";
+    }
+}
+
+GLuint createShader(const char* src, GLenum type) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint success; glGetShaderiv(s, GL_COMPILE_STATUS, &success);
+    if (!success) { char l[512]; glGetShaderInfoLog(s, 512, NULL, l); std::cerr << l << std::endl; exit(-1); }
+    return s;
+}
+
+inline Real sinc(Real x) { return (std::abs(x) < 1e-9) ? 1.0f : std::sin(x) / x; }
+
+// ==========================================
+// 3. 物理源与引擎
+// ==========================================
+// 雷克子波源
+struct RickerSource {
+    int cx, cy;
+    Real t, t_peak, f_peak, amp;
+    bool active;
+    RickerSource(int x, int y, Real freq, Real amplitude)
+        : cx(x), cy(y), f_peak(freq), amp(amplitude), t(0.0f), active(true) {
+        t_peak = 1.0f / f_peak;
+    }
+    Real getValue() {
+        Real x = PI * f_peak * (t - t_peak);
+        return amp * (1.0f - 2.0f * x * x) * std::exp(-x * x);
+    }
+    void update(Real dt) {
+        t += dt;
+        if (t > 2.5f * t_peak) active = false;
+    }
+};
+
+// 方波源
+struct SquarePulseSource {
+    int cx, cy; Real t, amp, duration; bool active;
+    SquarePulseSource(int x, int y, Real amplitude, Real pulseDuration)
+        : cx(x), cy(y), amp(amplitude), duration(pulseDuration), t(0.0f), active(true) {
+    }
+    Real getValue() { return (t < duration) ? amp : 0.0f; }
+    void update(Real dt) { if (active) { t += dt; if (t >= duration) active = false; } }
+};
+
+// Ormsby 子波源
+struct OrmsbySource {
+    int cx, cy; Real t, t_offset, amp, f1, f2, f3, f4; bool active;
+    OrmsbySource(int x, int y, Real f1, Real f2, Real f3, Real f4, Real amplitude)
+        : cx(x), cy(y), f1(f1), f2(f2), f3(f3), f4(f4), amp(amplitude), t(0.0f), active(true) {
+        t_offset = 0.2f;
+    }
+    Real getValue() {
+        Real current_t = t - t_offset;
+        Real term4 = f4 * f4 * sinc(PI * f4 * current_t) * sinc(PI * f4 * current_t);
+        Real term3 = f3 * f3 * sinc(PI * f3 * current_t) * sinc(PI * f3 * current_t);
+        Real term2 = f2 * f2 * sinc(PI * f2 * current_t) * sinc(PI * f2 * current_t);
+        Real term1 = f1 * f1 * sinc(PI * f1 * current_t) * sinc(PI * f1 * current_t);
+        Real alpha = (PI * PI) / ((f4 - f3) + (f2 - f1));
+        return amp * alpha * ((term4 - term3) - (term2 - term1));
+    }
+    void update(Real dt) { t += dt; if (t > 2.0f * t_offset) active = false; }
+};
+
+// 声学引擎核心类
+class AcousticEngine {
+public:
+    std::vector<Real> p, vx, vz;
+    std::vector<Real> coef_v, coef_p, damp_coef;
+    std::vector<Real> vp_data;
+    std::vector<Real> gpu_field, gpu_model;
+    std::list<RickerSource> sources;
+    std::vector<SquarePulseSource> sources_2;
+    std::vector<OrmsbySource> sources_OrmsbySource;
+
+    bool modelModified = true;
+    bool exploded = false;
+    bool paused = false;
+    bool useLineSource = false;
+    int boundaryMode = 0; // 0:Absorb, 1:Reflect, 2:Hide
+    bool enableFreeSurface = false;
+    int currentFreq = 100;
+
+    // 单点记录器
+    struct Recorder {
+        int gx, gy;
+        std::vector<float> history;
+        int maxHistory = 1200;
+        void update(const std::vector<Real>& field, int width) {
+            if (gx < 0 || gx >= width) return;
+            int idx = gy * width + gx;
+            if (idx >= 0 && idx < (int)field.size()) {
+                history.push_back(field[idx]);
+                if (history.size() > maxHistory) history.erase(history.begin());
+            }
+        }
+    } recorder;
+
+    // 阵列接收器
+    struct Receiver {
+        int gx, gy; std::vector<float> data;
+        Receiver(int x, int y, int capacity) : gx(x), gy(y) { data.reserve(capacity); }
+    };
+    std::vector<Receiver> receivers;
+    int maxHistoryLen = 1000;
+
+    AcousticEngine() {
+        size_t size = GRID_W * GRID_H;
+        p.resize(size, 0); vx.resize(size, 0); vz.resize(size, 0);
+        coef_v.resize(size); coef_p.resize(size); damp_coef.resize(size);
+        vp_data.resize(size); gpu_field.resize(size); gpu_model.resize(size);
+        initMaterial();
+        initDamping();
+        recorder.gx = GRID_W / 2; recorder.gy = GRID_H / 2; recorder.maxHistory = 1000;
+    }
+
+    void placeArray(int x1, int y1, int x2, int y2, int count) {
+        receivers.clear();
+        if (count < 1) count = 1;
+        for (int i = 0; i < count; ++i) {
+            float t = (count == 1) ? 0.0f : (float)i / (count - 1);
+            int cx = (int)(x1 + (x2 - x1) * t);
+            int cy = (int)(y1 + (y2 - y1) * t);
+            cx = std::max(2, std::min(GRID_W - 3, cx));
+            cy = std::max(2, std::min(GRID_H - 3, cy));
+            receivers.emplace_back(cx, cy, maxHistoryLen);
+        }
+    }
+
+    void updateReceivers() {
+        for (auto& r : receivers) {
+            int idx = r.gy * GRID_W + r.gx;
+            r.data.push_back(p[idx]);
+            if (r.data.size() > maxHistoryLen) r.data.erase(r.data.begin());
+        }
+    }
+
+    void clearReceiversData() { for (auto& r : receivers) r.data.clear(); }
+
+    void initMaterial() {
+#pragma omp parallel for
+        for (int y = 0; y < GRID_H; ++y) {
+            for (int x = 0; x < GRID_W; ++x) {
+                setParams(y * GRID_W + x, 2000.0f, 2000.0f);
+            }
+        }
+        modelModified = true;
+    }
+
+    // 修改后的 setParams
+    void setParams(int idx, Real Vp, Real Rho) {
+        vp_data[idx] = Vp;
+        if (Vp < 10.0f) {
+            coef_v[idx] = 0.0f;
+            coef_p[idx] = 0.0f;
+        }
+        else {
+            // 在系数中除以 DX
+            coef_v[idx] = (DT / DX) * (1.0f / Rho);
+            coef_p[idx] = (DT / DX) * (Rho * Vp * Vp);
+        }
+    }
+
+    void initDamping() {
+        const Real DAMP_STRENGTH = 0.025f;
+#pragma omp parallel for
+        for (int y = 0; y < GRID_H; ++y) {
+            for (int x = 0; x < GRID_W; ++x) {
+                int idx = y * GRID_W + x;
+                Real damping = 1.0f;
+
+                if (boundaryMode == 0) { // Absorbing Mode
+                    // 计算到左右边界的距离
+                    int dx = std::min(x, GRID_W - 1 - x);
+
+                    // 【关键修改】计算到上下边界的距离
+                    int dy;
+                    if (enableFreeSurface) {
+                        // 如果开启自由表面，只计算到底部的距离（顶部不设防）
+                        dy = GRID_H - 1 - y;
+                    }
+                    else {
+                        // 否则，顶部和底部都要计算
+                        dy = std::min(y, GRID_H - 1 - y);
+                    }
+
+                    // 取最小距离
+                    int min_dist = std::min(dx, dy);
+
+                    // 如果在阻尼层范围内，计算衰减系数
+                    if (min_dist < DAMP_WIDTH) {
+                        Real r = (Real)(DAMP_WIDTH - min_dist) / DAMP_WIDTH;
+                        damping = std::exp(-DAMP_STRENGTH * r * r * 10.0f);
+                    }
+                }
+                damp_coef[idx] = damping;
+            }
+        }
+    }
+
+    void toggleBoundary() { boundaryMode = !boundaryMode; initDamping(); }
+
+    void toggleFreeSurface() {
+        enableFreeSurface = !enableFreeSurface;
+        initDamping(); // 【关键修改】状态改变后，必须重新生成阻尼层
+    }
+
+    void hide_Boundary_damp() { boundaryMode = 2; }
+
+    void addSource(int x, int y) {
+        if (exploded) return;
+        float amp = 40000.0f;
+        if (useLineSource) {
+            int startY = (boundaryMode == 0) ? DAMP_WIDTH + 5 : 5;
+            int endY = (boundaryMode == 0) ? GRID_H - DAMP_WIDTH - 5 : GRID_H - 5;
+            for (int iy = startY; iy < endY; ++iy) if (iy % 2 == 0) sources.emplace_back(x, iy, currentFreq, amp * 0.4f);
+        }
+        else {
+            sources.emplace_back(x, y, currentFreq, amp);
+        }
+    }
+
+    void clearWavefield() {
+        std::fill(p.begin(), p.end(), 0.0f);
+        std::fill(vx.begin(), vx.end(), 0.0f);
+        std::fill(vz.begin(), vz.end(), 0.0f);
+        sources.clear(); exploded = false;
+        clearReceiversData();
+    }
+
+    void step() {
+        if (exploded) return;
+        Real* __restrict d_p = p.data();
+        Real* __restrict d_vx = vx.data();
+        Real* __restrict d_vz = vz.data();
+        const Real* __restrict d_cv = coef_v.data();
+        const Real* __restrict d_cp = coef_p.data();
+        const Real* __restrict d_damp = damp_coef.data();
+        const Real C1 = 9.0f / 8.0f;
+        const Real C2 = -1.0f / 24.0f;
+
+        // 1. Update V
+#pragma omp parallel for
+        for (int y = 2; y < GRID_H - 2; ++y) {
+            int row = y * GRID_W;
+            int row_u1 = (y - 1) * GRID_W; int row_d1 = (y + 1) * GRID_W;
+            int row_u2 = (y - 2) * GRID_W; int row_d2 = (y + 2) * GRID_W;
+            for (int x = 2; x < GRID_W - 2; ++x) {
+                int i = row + x;
+                if (d_cv[i] == 0.0f) continue;
+                Real dP_dx = C1 * (d_p[i + 1] - d_p[i]) + C2 * (d_p[i + 2] - d_p[i - 1]);
+                Real dP_dz = C1 * (d_p[row_d1 + x] - d_p[i]) + C2 * (d_p[row_d2 + x] - d_p[row_u1 + x]);
+                d_vx[i] -= d_cv[i] * dP_dx; d_vz[i] -= d_cv[i] * dP_dz;
+                Real d = d_damp[i]; d_vx[i] *= d; d_vz[i] *= d;
+            }
+        }
+        bool local_exploded = false;
+        // 2. Update P
+#pragma omp parallel for reduction(|:local_exploded)
+        for (int y = 2; y < GRID_H - 2; ++y) {
+            int row = y * GRID_W;
+            int row_u1 = (y - 1) * GRID_W; int row_d1 = (y + 1) * GRID_W;
+            int row_u2 = (y - 2) * GRID_W;
+            for (int x = 2; x < GRID_W - 2; ++x) {
+                int i = row + x;
+                if (d_cp[i] == 0.0f) continue;
+                Real dVx_dx = C1 * (d_vx[i] - d_vx[i - 1]) + C2 * (d_vx[i + 1] - d_vx[i - 2]);
+                Real dVz_dy = C1 * (d_vz[i] - d_vz[row_u1 + x]) + C2 * (d_vz[row_d1 + x] - d_vz[row_u2 + x]);
+                d_p[i] -= d_cp[i] * (dVx_dx + dVz_dy);
+                d_p[i] *= d_damp[i];
+                if (std::abs(d_p[i]) > 1e10) local_exploded = true;
+            }
+        }
+        if (local_exploded) exploded = true;
+
+        if (enableFreeSurface) {
+#pragma omp parallel for
+            for (int x = 0; x < GRID_W; ++x) { d_p[x] = 0; d_p[x + GRID_W] = 0; d_p[x + 2 * GRID_W] = 0; }
+        }
+        for (auto& s : sources) {
+            if (s.cx > 2 && s.cx < GRID_W - 2 && s.cy > 2 && s.cy < GRID_H - 2) {
+                int idx = s.cy * GRID_W + s.cx;
+                if (coef_p[idx] > 0.0f) d_p[idx] += s.getValue();
+            }
+            s.update(DT);
+        }
+        sources.remove_if([](const RickerSource& s) { return !s.active; });
+    }
+
+    void modifyMaterial(int cx, int cy, int radius, int type) {
+        int r2 = radius * radius;
+        int x0 = std::max(0, cx - radius), x1 = std::min(GRID_W - 1, cx + radius);
+        int y0 = std::max(0, cy - radius), y1 = std::min(GRID_H - 1, cy + radius);
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2) {
+                    int idx = y * GRID_W + x;
+                    if (type == 1) setParams(idx, 4500.0f, 2800.0f);
+                    else if (type == 2) setParams(idx, 1500.0f, 1000.0f);
+                    else if (type == 3) setParams(idx, 0.0f, 10000.0f);
+                    else { Real factor = (Real)y / GRID_H; setParams(idx, 2000.0f, 2000.0f); }
+                }
+            }
+        }
+        modelModified = true;
+    }
+
+    void prepareGPUData() {
+        if (modelModified) {
+#pragma omp parallel for
+            for (int i = 0; i < GRID_W * GRID_H; ++i) gpu_model[i] = vp_data[i];
+        }
+        std::memcpy(gpu_field.data(), p.data(), p.size() * sizeof(Real));
+    }
+
+    // --- 场景加载 ---
+    void loadScenario(int type) {
+        initMaterial(); clearWavefield();
+        if (type == 0) { // Double Slit
+            for (int y = 0; y < GRID_H; ++y)
+                if (abs(y - GRID_H / 2) > 30 && abs(y - GRID_H / 2) < 180) modifyMaterial(GRID_W / 2, y, 5, 3);
+            addSource(GRID_W / 4, GRID_H / 2);
+        }
+        else if (type == 1) { // Lens
+            int cx = GRID_W / 2, cy = GRID_H / 2;
+            for (int y = 0; y < GRID_H; ++y) for (int x = 0; x < GRID_W; ++x) {
+                if ((x - cx) * (x - cx) + (y - cy) * (y - cy) < 6400) setParams(y * GRID_W + x, 5000.f, 3000.f);
+            }
+            modelModified = true; addSource(GRID_W / 5, GRID_H / 2);
+        }
+        else if (type == 2) { // Crystal
+            for (int y = 100; y < GRID_H - 100; y += 40) for (int x = 200; x < GRID_W - 100; x += 40) modifyMaterial(x, y, 6, 3);
+            useLineSource = true; addSource(50, GRID_H / 2);
+        }
+        else if (type == 3) { // Waveguide
+#pragma omp parallel for
+            for (int y = 0; y < GRID_H; ++y) for (int x = 0; x < GRID_W; ++x) {
+                if (abs(y - GRID_H / 2) < 40) setParams(y * GRID_W + x, 1500.f, 1000.f);
+                else setParams(y * GRID_W + x, 2500.f, 2000.f);
+            }
+            modelModified = true; addSource(50, GRID_H / 2);
+        }
+    }
+
+    void setMaterialForGrid(AcousticEngine& engine, float lowSpeed, float highSpeed, float density = 1.0f, int scatterSize = 5.0) {
+        srand(static_cast<unsigned int>(8888));
+        for (int y = 0; y < GRID_H; ++y) {
+            for (int x = 0; x < GRID_W; ++x) {
+                if (rand() % 100 < density * 100) {
+                    bool isHighSpeed = rand() % 2 == 0;
+                    for (int dy = 0; dy < scatterSize && y + dy < GRID_H; ++dy) {
+                        for (int dx = 0; dx < scatterSize && x + dx < GRID_W; ++dx) {
+                            int index = (y + dy) * GRID_W + (x + dx);
+                            float speed = isHighSpeed ? highSpeed : lowSpeed;
+                            engine.setParams(index, speed, speed * 1.2f);
+                        }
+                    }
+                }
+                else {
+                    engine.setParams(y * GRID_W + x, 2000.f, 2000.f);
+                }
+            }
+        }
+    }
+
+    void loadScatteringScenario(AcousticEngine& engine, float scatterDensity = 0.1f) {
+        engine.initMaterial();
+        setMaterialForGrid(engine, 1500.f, 4500.f, scatterDensity, 1);
+        engine.modelModified = true;
+    }
+
+    void loadLayeredScenario(AcousticEngine& engine) {
+        engine.initMaterial(); engine.clearWavefield();
+        int layerCount = 3; float layerThickness = GRID_H / layerCount;
+        for (int y = 0; y < GRID_H; ++y) {
+            for (int x = 0; x < GRID_W; ++x) {
+                if (y < layerThickness) engine.setParams(y * GRID_W + x, 1500.f, 1000.f);
+                else if (y < 2 * layerThickness) engine.setParams(y * GRID_W + x, 2500.f, 1500.f);
+                else engine.setParams(y * GRID_W + x, 4500.f, 2800.f);
+            }
+        }
+        engine.modelModified = true; engine.addSource(GRID_W / 4, GRID_H / 2);
+    }
+
+    void loadCurvedScenario_Sine(AcousticEngine& engine) {
+        engine.initMaterial(); engine.clearWavefield();
+        float amplitude1 = 30.0f, frequency1 = 2.0f, verticalOffset1 = GRID_H / 3.0f;
+        float amplitude2 = 20.0f, frequency2 = 1.5f, verticalOffset2 = 2.0f * GRID_H / 3.0f;
+        for (int y = 0; y < GRID_H; ++y) {
+            for (int x = 0; x < GRID_W; ++x) {
+                float nx = (float)x / GRID_W * frequency1 * 2.0 * PI;
+                float b1 = amplitude1 * sin(nx) + verticalOffset1;
+                nx = (float)x / GRID_W * frequency2 * 2.0 * PI;
+                float b2 = amplitude2 * sin(nx) + verticalOffset2;
+                if (y < b1) engine.setParams(y * GRID_W + x, 314.f, 100.f);
+                else if (y < b2) engine.setParams(y * GRID_W + x, 2500.f, 1500.f);
+                else engine.setParams(y * GRID_W + x, 4500.f, 2800.f);
+            }
+        }
+        engine.modelModified = true; engine.addSource(GRID_W / 2, GRID_H / 4);
+    }
+
+    void loadRefractionScenario(AcousticEngine& engine, int layerCount = 3, float minSpeed = 1500.0f, float maxSpeed = 4500.0f) {
+        engine.initMaterial(); engine.clearWavefield();
+        float layerThickness = GRID_H / layerCount;
+        float layerSpeedStep = (maxSpeed - minSpeed) / layerCount;
+        for (int i = 0; i < layerCount; ++i) {
+            float layerSpeed = minSpeed + i * layerSpeedStep;
+            for (int y = i * layerThickness; y < (i + 1) * layerThickness && y < GRID_H; ++y) {
+                for (int x = 0; x < GRID_W; ++x) {
+                    engine.setParams(y * GRID_W + x, layerSpeed, layerSpeed * 1.2f);
+                }
+            }
+        }
+        engine.modelModified = true; engine.addSource(GRID_W / 4, GRID_H / 2);
+    }
+};
+
+// ==========================================
+// 4. 全局状态
+// ==========================================
+AcousticEngine engine;
+ToolMode currentTool = ToolMode::TRIGGER_SOURCE;
+RenderMode currentRenderMode = RenderMode::Clay_wetness;
+float displayGain = 0.0005f;
+float brushRadiusPx = 20.0f;
+bool showUI = true;
+bool singleStepTrigger = false;
+
+// 颜色定义
+float colPos[3] = { 1.0f, 0.4f, 0.0f };
+float colNeg[3] = { 0.0f, 0.2f, 0.8f };
+float colZero[3] = { 0.9f, 0.9f, 0.9f };
+float colClayBase[3] = { 0.72f, 0.35f, 0.22f };
+float colClayDark[3] = { 0.45f, 0.20f, 0.12f };
+float colmossColor[3] = { 0.3f, 0.5f, 0.1f };
+
+float colAbsorbColor[3] = { 0.2f, 0.8f, 0.2f };//vec3(1.0, 0.5, 0.0)
+std::array<float, 3> colBaseColor = { 0.12f, 0.12f, 0.14f };
+std::array<float, 3> colHighColor = { 0.12f, 0.12f, 0.14f };
+
+float cursorX = 0.0f, cursorY = 0.0f;
+
+// ==========================================
+// 5. 交互与输入处理
+// ==========================================
+ViewportInfo getViewport(int winW, int winH) {
+    ViewportInfo vp;
+    float targetAspect = (float)GRID_W / GRID_H;
+    float windowAspect = (float)winW / winH;
+    if (windowAspect > targetAspect) {
+        vp.h = winH; vp.w = (int)(winH * targetAspect); vp.x = (winW - vp.w) / 2; vp.y = 0;
+    }
+    else {
+        vp.w = winW; vp.h = (int)(winW / targetAspect); vp.x = 0; vp.y = (winH - vp.h) / 2;
+    }
+    vp.screenX = vp.x; vp.screenY = (winH - (vp.y + vp.h));
+    vp.scaleX = (float)vp.w / GRID_W; vp.scaleY = (float)vp.h / GRID_H;
+    return vp;
+}
+
+void process_input(GLFWwindow* window) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse) {
+        cursorX = -1.0f; isDraggingArray = false; return;
+    }
+
+    int winW, winH; glfwGetWindowSize(window, &winW, &winH);
+    ViewportInfo vp = getViewport(winW, winH);
+    double mx, my; glfwGetCursorPos(window, &mx, &my);
+
+    float relX = (float)mx - vp.screenX;
+    float relY = (float)my - vp.screenY;
+    float normX = relX / vp.w; float normY = relY / vp.h;
+    cursorX = normX; cursorY = normY;
+    int gx = (int)(normX * GRID_W); int gy = (int)(normY * GRID_H);
+
+    bool leftDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    bool leftRelease = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_RELEASE;
+
+    if (gx > 2 && gx < GRID_W - 2 && gy > 2 && gy < GRID_H - 2) {
+        if (currentTool == ToolMode::PLACE_ARRAY) {
+            if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS && !isDraggingArray) {
+                isDraggingArray = true; dragStartX = gx; dragStartY = gy;
+            }
+        }
+        else if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+            engine.recorder.gx = gx; engine.recorder.gy = gy; engine.recorder.history.clear();
+        }
+        else if (leftDown) {
+            if (currentTool == ToolMode::TRIGGER_SOURCE) {
+                static auto lastClickTime = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastClickTime).count() > 50) {
+                    engine.addSource(gx, gy); lastClickTime = now;
+                }
+            }
+            else {
+                int r = (int)(brushRadiusPx / vp.scaleX);
+                int type = 1;
+                if (currentTool == ToolMode::DRAW_HIGH_VEL) type = 1;
+                else if (currentTool == ToolMode::DRAW_LOW_VEL) type = 2;
+                else if (currentTool == ToolMode::DRAW_WALL) type = 3;
+                else if (currentTool == ToolMode::ERASE) type = 4;
+                engine.modifyMaterial(gx, gy, r, type);
+            }
+        }
+    }
+    else { cursorX = -1.0f; }
+
+    if (isDraggingArray && leftRelease) {
+        isDraggingArray = false;
+        engine.placeArray(dragStartX, dragStartY, gx, gy, arrayReceiverCount);
+    }
+}
+
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (ImGui::GetIO().WantCaptureKeyboard) return;
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+        if (key == GLFW_KEY_1) currentTool = ToolMode::TRIGGER_SOURCE;
+        if (key == GLFW_KEY_2) currentTool = ToolMode::DRAW_HIGH_VEL;
+        if (key == GLFW_KEY_3) currentTool = ToolMode::DRAW_LOW_VEL;
+        if (key == GLFW_KEY_5) currentTool = ToolMode::DRAW_WALL;
+        if (key == GLFW_KEY_4) currentTool = ToolMode::ERASE;
+        if (key == GLFW_KEY_6) currentTool = ToolMode::PLACE_ARRAY;
+
+        if (key == GLFW_KEY_7) engine.loadScenario(1);
+        if (key == GLFW_KEY_8) engine.loadScenario(2);
+        if (key == GLFW_KEY_9) engine.loadScenario(3);
+        if (key == GLFW_KEY_0) engine.loadScenario(0);
+
+        if (key == GLFW_KEY_Q) currentRenderMode = RenderMode::Clay_wetness;
+        if (key == GLFW_KEY_W) currentRenderMode = RenderMode::Black_White;
+        if (key == GLFW_KEY_E) currentRenderMode = RenderMode::MODEL;
+        if (key == GLFW_KEY_A) currentRenderMode = RenderMode::COOLWARM;
+        if (key == GLFW_KEY_D) currentRenderMode = RenderMode::CUSTOM;
+
+        if (key == GLFW_KEY_F) engine.toggleFreeSurface();
+        if (key == GLFW_KEY_B) engine.toggleBoundary();
+        if (key == GLFW_KEY_C) engine.clearWavefield();
+        if (key == GLFW_KEY_SPACE) engine.paused = !engine.paused;
+        if (key == GLFW_KEY_S) { engine.paused = true; singleStepTrigger = true; }
+        if (key == GLFW_KEY_L) engine.useLineSource = !engine.useLineSource;
+
+        if (key == GLFW_KEY_LEFT_BRACKET) engine.currentFreq = std::max(5.0f, engine.currentFreq - 2.0f);
+        if (key == GLFW_KEY_RIGHT_BRACKET) engine.currentFreq = std::min(100.0f, engine.currentFreq + 2.0f);
+        if (key == GLFW_KEY_BACKSPACE) { engine.initMaterial(); engine.clearWavefield(); }
+        if (key == GLFW_KEY_UP) displayGain *= 1.2f;
+        if (key == GLFW_KEY_DOWN) displayGain /= 1.2f;
+    }
+}
+
+void SetupImGuiStyle() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 10.0f; style.FrameRounding = 6.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.12f, 0.12f, 0.14f, 0.92f);
+    style.Colors[ImGuiCol_CheckMark] = ImVec4(0.00f, 1.00f, 0.80f, 1.00f);
+    style.Colors[ImGuiCol_PlotLines] = ImVec4(0.00f, 1.00f, 0.60f, 1.00f);
+    style.Colors[ImGuiCol_Button] = ImVec4(0.22f, 0.22f, 0.25f, 1.00f);
+    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.00f, 0.60f, 0.50f, 1.00f);
+}
+
+std::string get_exe_dir() {
+    char buffer[MAX_PATH]; GetModuleFileName(NULL, buffer, MAX_PATH);
+    std::string::size_type pos = std::string(buffer).find_last_of("\\/");
+    return std::string(buffer).substr(0, pos);
+}
+
+void switchToEnglishInput() {
+    ActivateKeyboardLayout((HKL)0x0409, KLF_ACTIVATE);
+}
+void switchToChineseInput() {
+    // 0x0804 代表中文（简体，中国）
+    ActivateKeyboardLayout((HKL)0x0804, KLF_ACTIVATE);
+}
+
+// 保存截图函数
+// x, y: 读取区域的左下角坐标 (OpenGL坐标系)
+// width, height: 读取区域的大小
+// 修改返回值类型为 std::string
+std::string saveWavefieldToPNG(int x, int y, int width, int height) {
+    std::vector<unsigned char> pixels(width * height * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+
+    // 翻转图像
+    int rowSize = width * 3;
+    std::vector<unsigned char> flippedRow(rowSize);
+    for (int i = 0; i < height / 2; ++i) {
+        unsigned char* rowTop = pixels.data() + i * rowSize;
+        unsigned char* rowBottom = pixels.data() + (height - 1 - i) * rowSize;
+        memcpy(flippedRow.data(), rowTop, rowSize);
+        memcpy(rowTop, rowBottom, rowSize);
+        memcpy(rowBottom, flippedRow.data(), rowSize);
+    }
+
+    // 生成文件名
+    std::time_t now = std::time(nullptr);
+    char filename[64];
+    std::strftime(filename, sizeof(filename), "Snapshot_%Y%m%d_%H%M%S.png", std::localtime(&now));
+
+    // 写入 PNG
+    if (stbi_write_png(filename, width, height, 3, pixels.data(), width * 3)) {
+        return std::string(filename); // 【修改】成功返回文件名
+    }
+    return ""; // 【修改】失败返回空
+}
+
+// ==========================================
+// 6. 主程序入口
+// ==========================================
+int main() {
+    if (!glfwInit()) return -1;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, "Acoustic Wave Pro (Ultimate)", NULL, NULL);
+    if (!window) return -1;
+
+    GLFWimage images[1];
+    std::string image_icon = "../resources/images/icon.png";
+    images[0].pixels = stbi_load(image_icon.c_str(), &images[0].width, &images[0].height, 0, 4);
+    if (images[0].pixels) { glfwSetWindowIcon(window, 1, images); stbi_image_free(images[0].pixels); }
+
+    glfwMakeContextCurrent(window);
+    glewExperimental = GL_TRUE;
+    glewInit();
+    glfwSwapInterval(0);
+    switchToEnglishInput();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    exe_dir = get_exe_dir();
+    std::string font_path = "../resources/font/consola.ttf";
+    io.Fonts->AddFontFromFileTTF(font_path.c_str(), 14.0f, nullptr, io.Fonts->GetGlyphRangesChineseFull());
+    io.FontGlobalScale = 1.5f;
+
+    SetupImGuiStyle();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+    glfwSetKeyCallback(window, key_callback);
+
+    // GL 初始化
+    float verts[] = { -1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1 };
+    GLuint VAO, VBO;
+    glGenVertexArrays(1, &VAO); glBindVertexArray(VAO);
+    glGenBuffers(1, &VBO); glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, 0); glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void*)8); glEnableVertexAttribArray(1);
+
+    std::string vsSourceString = loadShaderFromFile("../resources/shader/vs_code.glsl");
+    std::string fsSourceString = loadShaderFromFile("../resources/shader/fs_code.glsl");
+    GLuint vs = createShader(vsSourceString.c_str(), GL_VERTEX_SHADER);
+    GLuint fs = createShader(fsSourceString.c_str(), GL_FRAGMENT_SHADER);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs); glAttachShader(prog, fs);
+    glLinkProgram(prog);
+
+    GLuint fieldTex, modelTex;
+    glGenTextures(1, &fieldTex); glBindTexture(GL_TEXTURE_2D, fieldTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, GRID_W, GRID_H, 0, GL_RED, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &modelTex); glBindTexture(GL_TEXTURE_2D, modelTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, GRID_W, GRID_H, 0, GL_RED, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
+    engine.prepareGPUData();
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, modelTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RED, GL_FLOAT, engine.gpu_model.data());
+
+    
+    // 控制台操作手册
+    std::cout << "=== Acoustic Wave Pro (Console Version) ===\n";
+    std::cout << "-------------------------------------------\n";
+    std::cout << " [MODES]\n";
+    std::cout << "   Q: Liquid\n";
+    std::cout << "   W: Heatmap\n";
+    std::cout << "   E: Model\n";
+    std::cout << "   A: Coolwarm (NEW!)\n";
+    std::cout << "-------------------------------------------\n";
+    std::cout << " [SCENARIOS]\n";
+    std::cout << "   6: Double Slit\n";
+    std::cout << "   7: Acoustic Lens\n";
+    std::cout << "   8: Crystal\n";
+    std::cout << "   9: Waveguide\n";
+    std::cout << "-------------------------------------------\n";
+    std::cout << " [TOOLS]\n";
+    std::cout << "   1: Source (Left Click)\n";
+    std::cout << "   2: High Vel\n";
+    std::cout << "   3: Low Vel\n";
+    std::cout << "   5: Wall\n";
+    std::cout << "   4: Eraser\n";
+    std::cout << "-------------------------------------------\n";
+    std::cout << " [CONTROLS]\n";
+    std::cout << "   L: Line/Point Source\n";
+    std::cout << "   F: Free Surface\n";
+    std::cout << "   C: Clear\n";
+    std::cout << "   Space: Pause\n";
+    std::cout << "   [ / ]: Freq\n";
+    std::cout << "   Up/Down: Gain\n";
+    std::cout << "-------------------------------------------\n";
+
+    std::cout << "Detected CPU Threads: " << omp_get_max_threads() << std::endl;
+    std::cout << ">>> OpenMP Enabled." << std::endl;
+
+    int stepsPerFrame = 1;
+    auto lastT = std::chrono::high_resolution_clock::now();
+    int frames = 0;
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwSwapInterval(SwapInterval);
+        glfwPollEvents();
+        process_input(window);
+
+        // 物理模拟
+        bool performStep = !engine.paused;
+        if (singleStepTrigger) { performStep = true; singleStepTrigger = false; }
+        if (performStep && !engine.exploded) {
+            for (int i = 0; i < stepsPerFrame; ++i) engine.step();
+            engine.updateReceivers();
+            engine.recorder.update(engine.p, GRID_W);
+        }
+
+        // 数据上传
+        engine.prepareGPUData();
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, fieldTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RED, GL_FLOAT, engine.gpu_field.data());
+        if (engine.modelModified) {
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, modelTex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GRID_W, GRID_H, GL_RED, GL_FLOAT, engine.gpu_model.data());
+            engine.modelModified = false;
+        }
+
+        // 渲染流程
+        int winW, winH; glfwGetWindowSize(window, &winW, &winH);
+        ViewportInfo vp = getViewport(winW, winH);
+
+        glViewport(0, 0, winW, winH);
+        glClearColor(0.08f, 0.08f, 0.09f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glViewport(vp.x, vp.y, vp.w, vp.h);
+        glUseProgram(prog);
+
+        glUniform1i(glGetUniformLocation(prog, "bgTex"), 2);
+        glUniform1f(glGetUniformLocation(prog, "gain"), displayGain);
+        glUniform1i(glGetUniformLocation(prog, "mode"), (int)currentRenderMode);
+        glUniform2f(glGetUniformLocation(prog, "resolution"), (float)vp.w, (float)vp.h);
+        glUniform2f(glGetUniformLocation(prog, "gridSize"), (float)GRID_W, (float)GRID_H);
+        glUniform1i(glGetUniformLocation(prog, "dampWidth"), DAMP_WIDTH);
+        glUniform1i(glGetUniformLocation(prog, "boundaryMode"), engine.boundaryMode);
+        glUniform1i(glGetUniformLocation(prog, "freeSurface"), engine.enableFreeSurface ? 1 : 0);
+        glUniform1f(glGetUniformLocation(prog, "time"), (float)glfwGetTime());
+        glUniform1i(glGetUniformLocation(prog, "fieldTex"), 0);
+        glUniform1i(glGetUniformLocation(prog, "modelTex"), 1);
+
+        glUniform2f(glGetUniformLocation(prog, "mousePos"), cursorX, cursorY);
+        float scaledBrush = brushRadiusPx * ((float)vp.w / INITIAL_WINDOW_WIDTH);
+        glUniform1f(glGetUniformLocation(prog, "brushRadius"), scaledBrush);
+        glUniform1i(glGetUniformLocation(prog, "toolMode"), (int)currentTool);
+        glUniform1i(glGetUniformLocation(prog, "isLineSource"), engine.useLineSource ? 1 : 0);
+        glUniform2f(glGetUniformLocation(prog, "probePos"), (float)engine.recorder.gx / GRID_W, (float)engine.recorder.gy / GRID_H);
+
+        glUniform3f(glGetUniformLocation(prog, "colValPos"), colPos[0], colPos[1], colPos[2]);
+        glUniform3f(glGetUniformLocation(prog, "colValNeg"), colNeg[0], colNeg[1], colNeg[2]);
+        glUniform3f(glGetUniformLocation(prog, "colValZero"), colZero[0], colZero[1], colZero[2]);
+        glUniform1f(glGetUniformLocation(prog, "wetness"), wetness);
+        glUniform3f(glGetUniformLocation(prog, "colClayBase"), colClayBase[0], colClayBase[1], colClayBase[2]);
+        glUniform3f(glGetUniformLocation(prog, "colClayDark"), colClayDark[0], colClayDark[1], colClayDark[2]);
+        glUniform3f(glGetUniformLocation(prog, "colAbsorbColor"), colAbsorbColor[0], colAbsorbColor[1], colAbsorbColor[2]);
+
+        glUniform3f(glGetUniformLocation(prog, "colBaseColor"), colBaseColor[0], colBaseColor[1], colBaseColor[2]);
+        glUniform3f(glGetUniformLocation(prog, "colHighColor"), colHighColor[0], colHighColor[1], colHighColor[2]);
+
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        // ==========================================
+        //  [新增] 截图逻辑
+        //  放在 ImGui 渲染之前，只截取波场画面，不带 UI
+        // ==========================================
+        // 在 glDrawArrays 之后，ImGui 渲染之前
+        if (triggerScreenshot) {
+            std::string fName = saveWavefieldToPNG(vp.x, vp.y, vp.w, vp.h);
+            if (!fName.empty()) {
+                // 获取绝对路径 (Windows API)
+                char absPath[MAX_PATH];
+                if (_fullpath(absPath, fName.c_str(), MAX_PATH) != NULL) {
+                    lastSavedPath = std::string(absPath);
+                }
+                else {
+                    lastSavedPath = fName; // 如果获取绝对路径失败，就显示文件名
+                }
+
+                // 记录当前时间，触发提示框
+                saveMsgStartTime = glfwGetTime();
+            }
+            triggerScreenshot = false;
+        }
+
+        // --- ImGui 绘制 ---
+        glViewport(0, 0, winW, winH);
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        if (showUI) {
+            ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Once);
+            ImGui::SetNextWindowSize(ImVec2(520, 800), ImGuiCond_Once);
+            ImGui::Begin("Wave Control", NULL);
+
+            static double lastUiUpdateTime = 0.0;
+            static char FPSBuffer[64], timeBuffer[64], cursorBuffer[64];
+            double currentTime = glfwGetTime();
+            //----------------------------------------------
+            // 1. 将归一化坐标(0.0-1.0) 转换为 网格坐标(0-500)
+            int gridPosX = (int)(cursorX * GRID_W);
+            int gridPosY = (int)(cursorY * GRID_H);
+
+            // 2. 简单的边界限制，防止鼠标移出窗口时显示奇怪的数值
+            if (gridPosX < 0) gridPosX = 0;
+            if (gridPosX >= GRID_W) gridPosX = GRID_W - 1;
+            if (gridPosY < 0) gridPosY = 0;
+            if (gridPosY >= GRID_H) gridPosY = GRID_H - 1;
+            //----------------------------------------------
+            if (currentTime - lastUiUpdateTime > 0.1) {
+                lastUiUpdateTime = currentTime;
+                snprintf(timeBuffer, sizeof(timeBuffer), "App Time: %.2f s \nDT: %.6f s | DX: %.1f m", currentTime, DT, DX);
+                snprintf(FPSBuffer, sizeof(FPSBuffer), "FPS: %d | Grid: %dx%d", int(io.Framerate), GRID_W, GRID_H);
+                snprintf(cursorBuffer, sizeof(cursorBuffer), "Grid Pos: [%d, %d]", gridPosX, gridPosY);
+            }
+            ImGui::Text(FPSBuffer); ImGui::Text(timeBuffer);
+            ImGui::TextColored(ImVec4(0, 1, 0.8f, 1), cursorBuffer);
+            ImGui::Text("Actived Sources: %d", static_cast<int>(engine.sources.size()));
+            if (engine.exploded) ImGui::TextColored(ImVec4(1, 0.2f, 0.2f, 1), "STATUS: NUMERICAL EXPLOSION!");
+            else ImGui::TextColored(ImVec4(0, 1, 0.8f, 1), "Status: %s", engine.paused ? "PAUSED" : "RUNNING");
+
+            float btnW = (ImGui::GetContentRegionAvail().x - 20) / 2;
+            if (ImGui::Button(engine.paused ? " RESUME (Space) " : "  PAUSE (Space) ", ImVec2(btnW * 2, 35))) engine.paused = !engine.paused;
+            if (ImGui::Button(" STEP (S) ", ImVec2(btnW, 35))) { engine.paused = true; singleStepTrigger = true; }
+            ImGui::SameLine();
+            if (ImGui::Button(" CLEAR (C) ", ImVec2(btnW, 35))) engine.clearWavefield();
+            ImGui::Spacing(); ImGui::Separator();
+
+            if (ImGui::BeginTabBar("Tabs")) {
+                if (ImGui::BeginTabItem(" Tools ")) {
+                    ImGui::Spacing();
+                    const char* tools[] = { "Source Trigger (1)", "Draw Rock (2)", "Draw Lens (3)",
+                        "Draw Wall (5)", "Eraser (4)","Detector array (6)" };
+                    for (int i = 0; i < 6; i++) {
+                        if (ImGui::RadioButton(tools[i], (int)currentTool == i)) currentTool = (ToolMode)i;
+                        ImGui::Spacing();
+                    }
+                    ImGui::Separator();
+                    ImGui::RadioButton("Array Tool par", (int)currentTool == 5);
+                    if (currentTool == ToolMode::PLACE_ARRAY) {
+                        ImGui::Indent(); ImGui::SliderInt("Count", &arrayReceiverCount, 1, 100); ImGui::Unindent();
+                    }
+                    ImGui::Separator();
+                    ImGui::Checkbox("Line Source (L)", &engine.useLineSource);
+                    ImGui::Checkbox("Show recorder window", &show_recorder_window);
+                    ImGui::Checkbox("Show recorders window", &show_recorders_window);
+                    ImGui::Checkbox("SwapInterval", &SwapInterval);
+                    ImGui::Separator();
+                    // 在 "Settings" 或 "Tools" tab 里
+                    ImGui::Separator();
+                    if (ImGui::Button(" SNAPSHOT (P) ", ImVec2(-1, 35))) {
+                        triggerScreenshot = true;
+                    }
+                    // --- 绘制截图成功提示框 ---
+                    if (glfwGetTime() - saveMsgStartTime < SAVE_MSG_DURATION) {
+                        // 设置窗口位置：屏幕顶部中间
+                        // 1. 设置固定大小：宽 400像素，高 100像素
+                        ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, 0.0f), ImVec2(500.0f, 1000.0f));
+                        ImGui::SetNextWindowPos(ImVec2(winW * 0.5f, 100.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+
+                        // 设置窗口样式：透明背景、无标题栏、无输入、自动大小
+                        ImGui::SetNextWindowBgAlpha(0.8f);
+                        ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                            ImGuiWindowFlags_AlwaysAutoResize |
+                            ImGuiWindowFlags_NoSavedSettings |
+                            ImGuiWindowFlags_NoFocusOnAppearing |
+                            ImGuiWindowFlags_NoNav |
+                            ImGuiWindowFlags_NoMove;
+
+                        if (ImGui::Begin("SaveToast", NULL, flags)) {
+                            // 显示绿色对勾和标题
+                            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[SUCCESS]");
+                            ImGui::SameLine();
+                            ImGui::Text("Screenshot Saved!");
+
+                            ImGui::Separator();
+
+                            // 显示路径 (黄色高亮)
+                            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Path:");
+                            ImGui::SameLine();
+                            // 使用 TextWrapped 防止路径过长超出屏幕
+                            ImGui::TextWrapped("%s", lastSavedPath.c_str());
+                        }
+                        ImGui::End();
+                    }
+
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem(" Settings ")) {
+                    ImGui::Spacing(); ImGui::Text("Simulation");
+                    ImGui::SliderInt("Frequency", &engine.currentFreq, 5.0, 300.0);
+                    ImGui::SliderInt("Speed", &stepsPerFrame, 1, 50);
+                    ImGui::Spacing(); ImGui::Text("Interaction");
+                    ImGui::SliderFloat("Brush Size", &brushRadiusPx, 5.0f, 100.0f);
+                    ImGui::Spacing(); ImGui::Text("Boundaries");
+                    bool bFree = engine.enableFreeSurface;
+                    if (ImGui::Checkbox("Free Surface (F)", &bFree))
+                        engine.toggleFreeSurface(), engine.toggleBoundary();
+                    bool bReflect = (engine.boundaryMode == 0);
+                    if (ImGui::Checkbox("Absorb boundary (B)", &bReflect)) engine.toggleBoundary();
+                    bool bReflect2 = (engine.boundaryMode == 2);
+                    if (ImGui::Checkbox("Hide Absorb grid ", &bReflect2)) engine.hide_Boundary_damp();
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Scenarios")) {
+                    ImGui::Spacing(); ImGui::Separator(); ImGui::Text("Scenarios (7-0)");
+                    if (ImGui::Button("Double Slit", ImVec2(200, 0))) engine.loadScenario(0);
+                    if (ImGui::Button("Acoustic Lens", ImVec2(200, 0))) engine.loadScenario(1);
+                    if (ImGui::Button("Crystal", ImVec2(200, 0))) engine.loadScenario(2);
+                    if (ImGui::Button("Waveguide", ImVec2(200, 0))) engine.loadScenario(3);
+                    static float Scatter_factor = 0.5f;
+                    if (ImGui::Button("Random Scattering ", ImVec2(200, 0))) engine.loadScatteringScenario(engine, Scatter_factor);
+                    if (ImGui::SliderFloat("Scatter factor", &Scatter_factor, 0.0f, 1.0f)) engine.loadScatteringScenario(engine, Scatter_factor);
+                    if (ImGui::Button("Layered Model", ImVec2(200, 0))) engine.loadLayeredScenario(engine);
+                    if (ImGui::Button("CurvedScenario", ImVec2(200, 0))) engine.loadCurvedScenario_Sine(engine);
+
+                    static int layerCount = 3; static float minSpeed = 1500.0f; static float maxSpeed = 4500.0f;
+                    if (ImGui::Button("Multi Layered Model ", ImVec2(200, 0))) engine.loadRefractionScenario(engine, layerCount, minSpeed, maxSpeed);
+                    ImGui::SliderInt("Layer Count", &layerCount, 1, 10);
+                    ImGui::SliderFloat("Min Speed", &minSpeed, 1000.0f, 3000.0f);
+                    ImGui::SliderFloat("Max Speed", &maxSpeed, 3000.0f, 5000.0f);
+                    if (ImGui::Button("RESET SIMULATION", ImVec2(-1, 35))) { engine.initMaterial(); engine.clearWavefield(); }
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem(" Visuals ")) {
+                    ImGui::Spacing(); ImGui::Text("Render Mode");
+                    const char* modes[] = { "Liquid", "Heatmap", "Model(E)", "Coolwarm(A)",
+                        "Custom (D)","Jet","Black-White","Frosted Glass(7)",
+                        "Thin-Film","White_Porcelain(9)","Clay_Terracotta(10)",
+                        "liquid gold(11) ","emissive(12)","Clay_wetness(13)","Coolwarm_Metallic" };
+                    int modeIdx = (int)currentRenderMode;
+                    if (ImGui::Combo("##Mode", &modeIdx, modes, IM_ARRAYSIZE(modes))) currentRenderMode = (RenderMode)modeIdx;
+                    ImGui::Spacing(); ImGui::SliderFloat("Exposure", &displayGain, 0.0001f, 0.005f, "%.5f");
+                    if (ImGui::Button(" Reset_exposure ", ImVec2(btnW, 35))) { displayGain = 0.0005f; };
+                    if (currentRenderMode == RenderMode::CUSTOM) {
+                        ImGui::Spacing(); ImGui::Text("Custom Palette");
+                        ImGui::ColorEdit3("Positive", colPos); ImGui::ColorEdit3("Negative", colNeg); ImGui::ColorEdit3("Zero", colZero);
+                    }
+                    if (currentRenderMode == RenderMode::Clay_wetness) {
+                        ImGui::Spacing(); ImGui::Text("Custom Clay Palette");
+                        ImGui::ColorEdit3("ClayBase", colClayBase); ImGui::ColorEdit3("ClayDark", colClayDark);
+                        ImGui::ColorEdit3("mossColor", colmossColor); ImGui::SliderFloat("Clay_wetness", &wetness, 0.1f, 1.0f, "%.5f");
+                    }
+                    ImGui::Spacing(); ImGui::Text("Base Color-|");
+                    ImGui::ColorEdit3("colBaseColor", colBaseColor.data());
+                    ImGui::ColorEdit3("colHighColor", colHighColor.data());
+                    ImGui::ColorEdit3("AbsorbColor", colAbsorbColor);
+
+                    if (ImGui::Button(" Reset_Color ", ImVec2(btnW, 35)))
+                    {
+                        colBaseColor = { 0.12f, 0.12f, 0.14f };
+                        colHighColor = { 0.12f, 0.12f, 0.14f };
+                    };
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+            ImGui::End();
+
+            if (show_recorder_window) {
+                ImGui::SetNextWindowPos(ImVec2(10, 800), ImGuiCond_Once);
+                ImGui::SetNextWindowSize(ImVec2(520, 400), ImGuiCond_Once);
+                ImGui::Begin("Oscilloscope", &show_recorder_window);
+                ImGui::SliderInt("History Len", &engine.recorder.maxHistory, 100, 2000);
+                if (engine.recorder.history.size() > 0) {
+                    ImGui::PlotLines("##W", engine.recorder.history.data(), (int)engine.recorder.history.size(), 0, NULL, -5000.0f, 5000.0f, ImVec2(-1, 160));
+                }
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1), "Probe Position: (%d, %d) - Right Click to Move", engine.recorder.gx, engine.recorder.gy);
+                ImGui::End();
+            }
+
+            if (show_recorders_window) {
+                ImGui::SetNextWindowPos(ImVec2((float)winW - 520, 10), ImGuiCond_Once);
+                ImGui::SetNextWindowSize(ImVec2(520, 800), ImGuiCond_Once);
+                ImGui::Begin("Seismic Array Record", &show_recorders_window);
+                if (engine.receivers.empty()) {
+                    ImGui::Text("No receivers active."); ImGui::Text("Select 'Array Tool', Click & Drag on the map to place receivers.");
+                }
+                /*else {
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+                    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+                    draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 25, 255));
+                    draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
+                    static float waveGain = 1.0f;
+                    ImGui::SliderFloat("Gain", &waveGain, 0.1f, 10.0f);
+                    float rowHeight = canvas_size.y / engine.receivers.size();
+                    float timeStepWidth = canvas_size.x / engine.maxHistoryLen;
+                    if (rowHeight < 5.0f) rowHeight = 5.0f;
+                    ImGui::InvisibleButton("canvas", canvas_size);
+
+                    for (size_t i = 0; i < engine.receivers.size(); ++i) {
+                        const auto& r = engine.receivers[i];
+                        if (r.data.empty()) continue;
+                        float basePathY = canvas_pos.y + (i + 0.5f) * rowHeight;
+                        if (basePathY > canvas_pos.y + canvas_size.y) break;
+                        ImColor waveColor = ImColor(0.0f, 1.0f, 0.6f);
+                        for (size_t t = 0; t < r.data.size() - 1; ++t) {
+                            float x1 = canvas_pos.x + t * timeStepWidth;
+                            float y1 = basePathY - r.data[t] * waveGain * 0.05f;
+                            float x2 = canvas_pos.x + (t + 1) * timeStepWidth;
+                            float y2 = basePathY - r.data[t + 1] * waveGain * 0.05f;
+                            if (x1 < canvas_pos.x + canvas_size.x) draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.0f);
+                        }
+                        draw_list->AddLine(ImVec2(canvas_pos.x, basePathY), ImVec2(canvas_pos.x + canvas_size.x, basePathY), IM_COL32(50, 50, 60, 100));
+                        char label[16]; sprintf(label, "R%d", (int)i);
+                        draw_list->AddText(ImVec2(canvas_pos.x + 2, basePathY - 7), IM_COL32(150, 150, 150, 200), label);
+                    }
+                }*/
+                //vertical
+                else {
+                    // --- 1. 顶部控件区域 ---
+                    // 先画滑块，让它占据顶部的空间
+                    static float waveGain = 0.05f;
+                    ImGui::SetNextItemWidth(200.0f); // 设置滑块宽度，不要太长
+                    ImGui::SliderFloat("Gain", &waveGain, 0.01f, 1.0f);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adjust the amplitude of the seismic traces");
+                    ImGui::SameLine();
+                    if (ImGui::Button(" Reset_Gain ", ImVec2(btnW, 35))){waveGain = 0.05f;};
+                    ImGui::Separator(); // 画一条分割线
+
+                    // --- 2. 画布区域计算 ---
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 canvas_pos = ImGui::GetCursorScreenPos(); // 获取滑块下方的起始位置
+                    ImVec2 canvas_size = ImGui::GetContentRegionAvail(); // 获取剩余的全部空间
+
+                    // 限制一下画布最小高度，防止出错
+                    if (canvas_size.y < 50.0f) canvas_size.y = 50.0f;
+
+                    // --- 3. 绘制背景和网格 ---
+                    // 3.1 背景色
+                    draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 25, 255));
+
+                    // 3.2 限制绘图区域 (Clip Rect)
+                    // 这一步非常重要！确保波形太强时不会画到滑块上面去
+                    draw_list->PushClipRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), true);
+
+                    // 3.3 绘制水平网格线 (时间深度网格)
+                    int gridRows = 10; // 将Y轴分为10份
+                    for (int r = 1; r < gridRows; ++r) {
+                        float y = canvas_pos.y + (canvas_size.y / gridRows) * r;
+                        // 画细淡的灰色横线
+                        draw_list->AddLine(
+                            ImVec2(canvas_pos.x, y),
+                            ImVec2(canvas_pos.x + canvas_size.x, y),
+                            IM_COL32(60, 60, 70, 80)
+                        );
+                    }
+
+                    // --- 4. 核心波形绘制逻辑 ---
+
+                    // 定义左右边距 (Padding)
+                    float paddingX = 20.0f;
+
+                    // 计算可用宽度
+                    float usableWidth = canvas_size.x - (paddingX * 2.0f);
+
+                    // 计算每一道的宽度
+                    float colWidth = usableWidth / engine.receivers.size();
+                    float timeStepHeight = canvas_size.y / engine.maxHistoryLen;
+
+                    // 占位按钮 (为了让 ImGui 知道这里有东西，支持鼠标滚轮等)
+                    ImGui::InvisibleButton("canvas", canvas_size);
+
+                    for (size_t i = 0; i < engine.receivers.size(); ++i) {
+                        const auto& r = engine.receivers[i];
+                        if (r.data.empty()) continue;
+
+                        // 计算当前道的基准 X 坐标
+                        // 公式：画布左边 + 左边距 + (第i个 * 宽度) + 半个宽度(居中)
+                        float basePathX = canvas_pos.x + paddingX + (i * colWidth) + (colWidth * 0.5f);
+
+                        ImColor waveColor = ImColor(0.0f, 1.0f, 0.6f);
+                        ImColor centerLineColor = IM_COL32(50, 50, 60, 150);
+
+                        // 绘制垂直基准线 (道中心线)
+                        draw_list->AddLine(
+                            ImVec2(basePathX, canvas_pos.y),
+                            ImVec2(basePathX, canvas_pos.y + canvas_size.y),
+                            centerLineColor
+                        );
+
+                        // 绘制波形 (Wiggle Trace)
+                        // 优化：步长设为2，减少一半的绘制点数，提高性能
+                        for (size_t t = 0; t < r.data.size() - 1; t += 1) {
+                            float y1 = canvas_pos.y + t * timeStepHeight;
+                            float y2 = canvas_pos.y + (t + 1) * timeStepHeight;
+
+                            // 振幅限制：防止单一波形过大覆盖了整个屏幕
+                            // 这里的 0.05f 是振幅缩放系数，可以根据需要微调
+                            float val1 = r.data[t] * waveGain * 0.15f;
+                            float val2 = r.data[t + 1] * waveGain * 0.15f;
+
+                            // 简单的钳制，防止画太远
+                            float maxDeviation = colWidth * 2.0f; // 允许波形稍微重叠，但不允许飞太远
+                            if (val1 > maxDeviation) val1 = maxDeviation;
+                            if (val1 < -maxDeviation) val1 = -maxDeviation;
+                            if (val2 > maxDeviation) val2 = maxDeviation;
+                            if (val2 < -maxDeviation) val2 = -maxDeviation;
+
+                            float x1 = basePathX + val1;
+                            float x2 = basePathX + val2;
+
+                            if (y1 < canvas_pos.y + canvas_size.y) {
+                                draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.5f); // 线条稍微加粗一点点 (1.5f)
+                            }
+                        }
+
+                        // 绘制标签 (放在顶部)
+                        char label[16]; sprintf(label, "%d", (int)i);
+                        // 简单居中文字
+                        float textWidth = ImGui::CalcTextSize(label).x;
+                        draw_list->AddText(ImVec2(basePathX - textWidth * 0.5f, canvas_pos.y + 5), IM_COL32(200, 200, 200, 255), label);
+                    }
+
+                    // 绘制外边框
+                    draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
+
+                    // 结束裁剪
+                    draw_list->PopClipRect();
+                }
+                ImGui::End();
+
+                float scaleX = (float)vp.w / GRID_W;
+                float scaleY = (float)vp.h / GRID_H;
+                float screenOriginX = vp.screenX;
+                float screenOriginY = vp.screenY;
+                // 注意：process_input 里 vp.screenY 是反的(相对于底部的)，但ImGui绘图是相对于顶部的
+                // 正确的 ImGui Y = 窗口高度 - (glY + glH) + (GRID_H - gy)*scaleY ... 有点复杂
+                // 最简单的方法：利用TexCoord映射。
+                // OpenGL渲染时: TexCoord (0,0) 在左下角(物理内存开头)，但Shader里做了 TexCoord.y = 1.0 - TexCoord.y 翻转。
+                // 我们的 grid (0,0) 是内存开头 (top-left in standard image processing, but bottom-left in physics usually).
+                // 让我们看代码: int idx = y * GRID_W + x; 
+                // process_input 中: relY = my - vp.screenY; normY = relY / vp.h;
+                // 所以 grid (0,0) 对应屏幕顶部。
+
+                // 修正 ImGui 绘图的 Origin
+                ImVec2 glScreenPos(vp.x, vp.y); // 这是 OpenGL Viewport 左上角在窗口中的位置
+
+                ImDrawList* fg_list = ImGui::GetForegroundDrawList();
+
+                // 定义样式参数
+                const float geoSize = 12.0f; // 检波器图标大小
+                const ImU32 colCable = IM_COL32(200, 200, 200, 180); // 线缆颜色
+                const ImU32 colGeoFill = IM_COL32(255, 140, 0, 255); // 检波器填充 (深橙色)
+                const ImU32 colGeoBorder = IM_COL32(0, 0, 0, 255);   // 检波器描边 (黑色)
+                const ImU32 colPreview = IM_COL32(255, 255, 0, 150); // 预览颜色
+
+                // 1. 绘制已放置的检波器 (倒三角形 + 线缆)
+                if (!engine.receivers.empty()) {
+                    // A. 先画线缆 (连接所有检波器)
+                    // 为了性能，我们不画几百条线段，而是简单地画一条贯穿首尾的线（假设是直线阵列）
+                    // 如果阵列是弯曲的，则需要循环画线。这里假设是直线工具生成的：
+                    if (engine.receivers.size() > 1) {
+                        const auto& rFirst = engine.receivers.front();
+                        const auto& rLast = engine.receivers.back();
+                        ImVec2 p1(glScreenPos.x + rFirst.gx * scaleX, glScreenPos.y + rFirst.gy * scaleY);
+                        ImVec2 p2(glScreenPos.x + rLast.gx * scaleX, glScreenPos.y + rLast.gy * scaleY);
+                        fg_list->AddLine(p1, p2, colCable, 2.0f);
+                    }
+
+                    // B. 再画检波器图标 (倒三角)
+                    for (size_t i = 0; i < engine.receivers.size(); ++i) {
+                        const auto& r = engine.receivers[i];
+                        float px = glScreenPos.x + r.gx * scaleX;
+                        float py = glScreenPos.y + r.gy * scaleY;
+
+                        // 倒三角形顶点计算
+                        ImVec2 pTopLeft(px - geoSize * 0.7f, py - geoSize * 0.7f);
+                        ImVec2 pTopRight(px + geoSize * 0.7f, py - geoSize * 0.7f);
+                        ImVec2 pBottom(px, py + geoSize);
+
+                        fg_list->AddTriangleFilled(pTopLeft, pTopRight, pBottom, colGeoFill);
+                        fg_list->AddTriangle(pTopLeft, pTopRight, pBottom, colGeoBorder);
+
+                        // 可选：绘制首尾编号
+                        if (i == 0 || i == engine.receivers.size() - 1) {
+                            char idText[8]; sprintf(idText, "%d", (int)i);
+                            fg_list->AddText(ImVec2(px + 8, py - 8), IM_COL32(255, 255, 255, 200), idText);
+                        }
+                    }
+                }
+
+                // 2. 绘制拖拽过程中的预览 (虚影)
+                if (isDraggingArray && currentTool == ToolMode::PLACE_ARRAY) {
+                    float startPx = glScreenPos.x + dragStartX * scaleX;
+                    float startPy = glScreenPos.y + dragStartY * scaleY;
+                    float endPx = glScreenPos.x + cursorX * GRID_W * scaleX;
+                    float endPy = glScreenPos.y + cursorY * GRID_H * scaleY;
+
+                    // 绘制预览中轴线
+                    fg_list->AddLine(ImVec2(startPx, startPy), ImVec2(endPx, endPy), colPreview, 1.0f);
+
+                    // 显示总数标签
+                    char countLabel[32];
+                    sprintf(countLabel, "Count: %d", arrayReceiverCount);
+                    fg_list->AddText(ImVec2(endPx + 10, endPy + 10), IM_COL32(255, 255, 0, 255), countLabel);
+
+                    // 绘制预览点
+                    int count = arrayReceiverCount;
+                    for (int i = 0; i < count; ++i) {
+                        float t = (count == 1) ? 0.0f : (float)i / (count - 1);
+                        float tx = startPx + (endPx - startPx) * t;
+                        float ty = startPy + (endPy - startPy) * t;
+
+                        // 预览用简单的圆形或半透明三角
+                        fg_list->AddCircleFilled(ImVec2(tx, ty), 3.0f, colPreview);
+                    }
+
+                    // 绘制起点和终点的十字准星，辅助对齐
+                    fg_list->AddLine(ImVec2(startPx - 5, startPy), ImVec2(startPx + 5, startPy), colPreview);
+                    fg_list->AddLine(ImVec2(startPx, startPy - 5), ImVec2(startPx, startPy + 5), colPreview);
+                    fg_list->AddLine(ImVec2(endPx - 5, endPy), ImVec2(endPx + 5, endPy), colPreview);
+                    fg_list->AddLine(ImVec2(endPx, endPy - 5), ImVec2(endPx, endPy + 5), colPreview);
+                }
+            }
+        }
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+
+        frames++;
+        auto now = std::chrono::high_resolution_clock::now();
+        if (std::chrono::duration<double>(now - lastT).count() >= 1.0) {
+            std::string t = "Wave Pro | FPS: " + std::to_string(frames);
+            glfwSetWindowTitle(window, t.c_str());
+            frames = 0; lastT = now;
+        }
+    }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwTerminate();
+    switchToChineseInput();
+
+    return 0;
+}
