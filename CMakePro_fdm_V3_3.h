@@ -93,8 +93,8 @@ enum class ToolMode {
 // 渲染模式枚举
 enum class RenderMode {
     LIQUID = 0, HEATMAP = 1, MODEL = 2, COOLWARM = 3, CUSTOM = 4, JET = 5,
-    Black_White = 6, Liquid_Glass = 7, Ceramic_Effect = 8, White_Porcelain = 9,
-    Clay_Terracotta = 10, liquid_mercury = 11, Water = 12, Clay_wetness = 13, 
+    Black_White = 6, Frosted_Glass = 7, Thin_Film = 8, Porcelain = 9,
+    Clay_Terracotta = 10, PBR_Gold = 11, Hologram = 12, Clay_wetness = 13,
     Coolwarm_Metallic = 14
 };
 
@@ -289,6 +289,27 @@ public:
 
     // --- 修改 setParams 以支持 Vs ---
     void setParams(int idx, Real Vp, Real Rho) {
+        vp_data[idx] = Vp;
+        rho_data[idx] = Rho;
+
+        // 自动设置 Vs (剪切波速度)
+        // 液体/气体 (Vp < 1550) Vs = 0
+        // 固体 Vs ≈ Vp / 1.732 (泊松体)
+        Real Vs = 0.0f;
+        if (Vp > 500.0f) {
+            Vs = Vp / 1.732f;
+        }
+        vs_data[idx] = Vs;
+
+        // 声波方程系数
+        if (Vp < 10.0f) { coef_v[idx] = 0.0f; coef_p[idx] = 0.0f; }
+        else {
+            coef_v[idx] = (DT / DX) * (1.0f / Rho);
+            coef_p[idx] = (DT / DX) * (Rho * Vp * Vp);
+        }
+    }
+
+    void setParams(AcousticEngine& engine, int idx, Real Vp, Real Rho) {
         vp_data[idx] = Vp;
         rho_data[idx] = Rho;
 
@@ -907,7 +928,8 @@ public:
         // x = 500, z = 300 (在2D网格中 z 通常对应 y 轴)
         engine.addSource(250, 150);
     }
-};
+
+    };
 
 // ==========================================
 // 4. 全局状态
@@ -929,7 +951,7 @@ float colClayBase[3] = { 0.72f, 0.35f, 0.22f };
 float colClayDark[3] = { 0.45f, 0.20f, 0.12f };
 float colmossColor[3] = { 0.3f, 0.5f, 0.1f };
 
-float colAbsorbColor[3] = { 0.2f, 0.8f, 0.2f };//vec3(1.0, 0.5, 0.0)
+float colAbsorbColor[3] = {1.0f, 0.6f, 0.2f };//vec3(1.0, 0.5, 0.0)
 std::array<float, 3> colBaseColor = { 0.12f, 0.12f, 0.14f };
 int scale_fac = 2;
 std::array<float, 3> colHighColor = { 0.12f* scale_fac, 0.12f* scale_fac, 0.14f* scale_fac };
@@ -1149,15 +1171,12 @@ void startRecording() {
 
 //# 在图片文件夹内运行
 //ffmpeg - framerate 60 - i frame_ % 05d.png - c:v libx264 - pix_fmt yuv420p output.mp4
-
 //ffmpeg - r 60 - i frame_ % 05d.png - c:v libx264 output.mp4
-
 void stopRecording() {
     isRecording = false;
     std::cout << ">>> Recording Stopped. Total frames: " << recordFrameCount << std::endl;
     // 这里可以提示用户如何使用 FFmpeg 合成
 }
-
 // 放在 main 函数内部，或者作为独立函数
 void resizeGLTextures(GLuint fieldTex, GLuint modelTex, int w, int h) {
     glBindTexture(GL_TEXTURE_2D, fieldTex);
@@ -1204,8 +1223,6 @@ void DrawStatusOverlay(bool* p_open, int gridW, int gridH, float cursorX, float 
     }
     ImGui::End();
 }
-
-
 
 void Init_Imgui(GLFWwindow* window) {
     IMGUI_CHECKVERSION();
@@ -1254,8 +1271,380 @@ void Manual_print() {
     std::cout << "   Up/Down: Gain\n";
     std::cout << "-------------------------------------------\n";
 
-    std::cout << "Detected CPU Threads: " << omp_get_max_threads() << std::endl;
-    std::cout << ">>> OpenMP Enabled." << std::endl;
+}
+// 将此代码放在你的 ImGui 渲染循环中 (例如 RenderUI() 函数内)
+void RenderThreadControl(){
+    // 定义一个控制窗口显示的布尔值
+    // 如果是在函数内部，记得加 static；如果是全局变量则不需要
+    static bool showThreadConfig = false;
+    // ==========================================================
+    // 1. 触发部分：放在你的主界面、菜单栏或工具栏中
+    // ==========================================================
+    // 可以在这里点击打开窗口
+    if (ImGui::Button("CPU Settings")) {
+        showThreadConfig = true;
+    }
+    // ==========================================================
+    // 2. 弹窗逻辑部分：每一帧都要调用
+    // ==========================================================
+    if (showThreadConfig)
+    {
+        // 注意这里传入了 &showThreadConfig
+        // 这会在窗口右上角创建一个 "X" 关闭按钮，点击后自动将 showThreadConfig 设为 false
+        ImGui::SetNextWindowSize(ImVec2(350, 200), ImGuiCond_FirstUseEver); // 设置个默认大小
+        if (ImGui::Begin("Thread Configuration", &showThreadConfig))
+        {
+            // --- 初始化状态 (只执行一次) ---
+            static bool isInitialized = false;
+            static int currentThreads = 1;
+            static int maxProcs = 1;
+
+            if (!isInitialized) {
+                maxProcs = omp_get_num_procs();
+                currentThreads = omp_get_max_threads(); // 获取当前 OpenMP 设置的值
+                isInitialized = true;
+            }
+
+            ImGui::Text("Detected Hardware Cores: %d", maxProcs);
+            ImGui::Separator();
+
+            // --- 滑动条 ---
+            // 拖动结束或数值改变时更新 OpenMP
+            if (ImGui::SliderInt("Threads", &currentThreads, 1, maxProcs)) {
+                omp_set_num_threads(currentThreads);
+            }
+
+            // --- 快捷按钮 ---
+            if (ImGui::Button("Min (1)")) {
+                currentThreads = 1;
+                omp_set_num_threads(currentThreads);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Half")) {
+                currentThreads = maxProcs / 2;
+                if (currentThreads < 1) currentThreads = 1;
+                omp_set_num_threads(currentThreads);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Max")) {
+                currentThreads = maxProcs;
+                omp_set_num_threads(currentThreads);
+            }
+
+            // --- 动态可视化进度条 ---
+            ImGui::Spacing();
+            ImGui::Text("Active Utilization:");
+
+            float fraction = (float)currentThreads / (float)maxProcs;
+
+            // 颜色逻辑：低负载(绿) -> 高负载(红)
+            ImVec4 progressColor = ImVec4(fraction, 1.0f - fraction, 0.2f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, progressColor);
+
+            char overlay[32];
+            sprintf(overlay, "%d Threads", currentThreads);
+            ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), overlay);
+
+            // (可选)提示信息
+                if (currentThreads == maxProcs) {
+                    ImGui::TextColored(ImVec4(1, 1, 0, 1), "Warning: Full load may affect UI responsiveness.");
+                }
+
+            ImGui::PopStyleColor();
+
+            // --- 底部关闭按钮 (可选，为了方便用户) ---
+            ImGui::Spacing();
+            ImGui::Separator();
+            if (ImGui::Button("Close", ImVec2(-1, 0))) { // -1 表示宽度填满
+                showThreadConfig = false;
+            }
+        }
+        ImGui::End();
+    }
+}
+
+//导出模型数据
+void exportModelData(const AcousticEngine& engine, const std::string& vpFilename, const std::string& rhoFilename) {
+    std::cout << "[IO] Starting model export..." << std::endl;
+
+    // 1. 打开文件流
+    std::ofstream fileVp(vpFilename);
+    std::ofstream fileRho(rhoFilename);
+
+    if (!fileVp.is_open() || !fileRho.is_open()) {
+        std::cerr << "[IO] Error: Failed to create output files." << std::endl;
+        return;
+    }
+
+    // 2. 设置高精度，防止数据截断导致模拟误差
+    // 使用 fixed 或 scientific 均可，这里保留 4 位小数
+    fileVp << std::fixed << std::setprecision(4);
+    fileRho << std::fixed << std::setprecision(4);
+
+    // 3. 遍历数据并写入
+    // 注意：数据在内存中是一维的 (idx = y * W + x)，但在文件中我们要写成二维格式
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            int idx = y * GRID_W + x;
+
+            // 获取数据 (假设 engine.vp_data 和 engine.rho_data 是 public 的 std::vector<float>)
+            // 如果是 private，请提供 getVp(idx) 接口
+            float vp = engine.vp_data[idx];
+            float rho = engine.rho_data[idx];
+
+            // 写入数值
+            fileVp << vp;
+            fileRho << rho;
+
+            // 如果不是这一行的最后一个数，加空格分隔
+            if (x < GRID_W - 1) {
+                fileVp << " ";
+                fileRho << " ";
+            }
+        }
+        // 一行结束，写入换行符
+        fileVp << "\n";
+        fileRho << "\n";
+    }
+
+    // 4. 关闭文件
+    fileVp.close();
+    fileRho.close();
+
+    std::cout << "[IO] Export success!" << std::endl;
+    std::cout << "     -> " << vpFilename << std::endl;
+    std::cout << "     -> " << rhoFilename << std::endl;
+}
+// 辅助：读取文件确定网格尺寸
+bool GetMatrixSize(const std::string& path, int& outW, int& outH) {
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+
+    std::string line;
+    int rows = 0;
+    int cols = 0;
+
+    // 读取第一行计算列数
+    if (std::getline(file, line)) {
+        std::stringstream ss(line);
+        float val;
+        while (ss >> val) cols++;
+        rows++;
+    }
+    // 读取剩余行
+    while (std::getline(file, line)) {
+        if (!line.empty()) rows++;
+    }
+    outW = cols;
+    outH = rows;
+    return (outW > 0 && outH > 0);
+}
+
+void uploadModelToGPU(const AcousticEngine& engine, GLuint modelTex, int width, int height) {
+    // 1. 准备上传缓冲区 (RGBA格式: R=Vp, G=Rho, B=未使用, A=未使用)
+    // 大小 = 宽 * 高 * 4个通道
+    std::vector<float> textureBuffer(width * height * 4);
+
+#pragma omp parallel for
+    for (int i = 0; i < width * height; ++i) {
+        // 获取 CPU 数据
+        float vp = engine.vp_data[i];
+        float rho = engine.rho_data[i];
+
+        // 填充到纹理缓冲区
+        // 假设 Shader 里: model.r = Vp, model.g = Rho
+        textureBuffer[i * 4 + 0] = vp;       // R通道
+        textureBuffer[i * 4 + 1] = rho;      // G通道
+        textureBuffer[i * 4 + 2] = 0.0f;     // B (padding)
+        textureBuffer[i * 4 + 3] = 0.0f;     // A (padding)
+    }
+
+    // 2. 上传到 GPU
+    glBindTexture(GL_TEXTURE_2D, modelTex);
+
+    // 注意：这里我们使用刚刚填充好的 textureBuffer.data()
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_FLOAT, textureBuffer.data());
+
+    glBindTexture(GL_TEXTURE_2D, 0); // 解绑
+
+    std::cout << "[GPU] Model texture updated successfully." << std::endl;
+}
+//加载模型数据
+bool loadModelFromData(AcousticEngine& engine,
+    const std::string& vpFilename,
+    const std::string& rhoFilename,
+    GLuint& fieldTex, GLuint& modelTex) // 需要传入纹理ID以便重置
+{
+    
+    // 1. 预读取尺寸
+    int w1, h1, w2, h2;
+    if (!GetMatrixSize(vpFilename, w1, h1) || !GetMatrixSize(rhoFilename, w2, h2)) {
+        std::cerr << "[IO] Error: Could not read file dimensions." << std::endl;
+        return false;
+    }
+
+    if (w1 != w2 || h1 != h2) {
+        std::cerr << "[IO] Error: Mismatch dimensions! Vp:" << w1 << "x" << h1 << ", Rho:" << w2 << "x" << h2 << std::endl;
+        return false;
+    }
+
+    // 2. 调整引擎大小 (Resize)
+    std::cout << "[IO] Resizing simulation to " << w1 << "x" << h1 << "..." << std::endl;
+
+    // 更新全局网格变量 (假设你有 GRID_W 等全局变量)
+    extern int GRID_W, GRID_H; // 声明引用全局变量
+    GRID_W = w1;
+    GRID_H = h1;
+
+    engine.resizeSimulation(GRID_W, GRID_H);
+    resizeGLTextures(fieldTex, modelTex, GRID_W, GRID_H); // 调整显存纹理
+
+    // 3. 读取数据
+    std::ifstream fileVp(vpFilename);
+    std::ifstream fileRho(rhoFilename);
+
+    float tempVp, tempRho;
+    int idx = 0;
+
+    // 确保清空波场
+    // 1. 初始化与清空
+    engine.initMaterial();
+    engine.clearWavefield();
+
+    while (fileVp >> tempVp && fileRho >> tempRho) {
+        if (idx >= GRID_W * GRID_H) break;
+        //engine.vp_data[idx] = tempVp;
+        //engine.rho_data[idx] = tempRho;
+        engine.setParams(engine, idx, tempVp, tempRho);
+
+        idx++;
+    }
+    // ===============================================
+    // 【关键修复】将读取到的数据上传到显卡
+    // ===============================================
+    uploadModelToGPU(engine, modelTex, GRID_W, GRID_H);
+
+    // 标记更新
+    engine.modelModified = true;
+
+    // 建议：重置一下震源位置，防止震源跑出新网格的范围
+     engine.addSource(GRID_W / 2,GRID_H / 2);
+
+    std::cout << "[IO] Model loaded successfully!" << std::endl;
+    return true;
+}
+
+bool OpenWindowsFileDialog(char* buffer, int bufferSize) {
+    OPENFILENAMEA ofn; // 使用 A 版本对应 char*
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL; // 如果有 glfw 的 HWND 可以填入，填 NULL 也没问题
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = bufferSize;
+    // 过滤器：只显示 txt 文件，或者所有文件
+    ofn.lpstrFilter = "Model Data (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    // 关键：OFN_NOCHANGEDIR 防止改变程序当前目录，导致资源加载失败
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+
+    // 如果用户点击了“打开”，返回 true
+    return GetOpenFileNameA(&ofn);
+}
+
+void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& modelTex)
+{
+    static bool showWindow = false;
+
+    // 用于存储路径的缓冲区
+    // static 保证下一帧数据还在
+    static char vpPath[1024] = "";
+    static char rhoPath[1024] = "";
+
+    // 状态提示
+    static std::string statusMsg = "";
+
+    if (ImGui::Button("Import Model (Win32)")) {
+        showWindow = true;
+    }
+
+    if (showWindow) {
+        ImGui::SetNextWindowSize(ImVec2(500, 350), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Import from Local", &showWindow)) {
+
+            ImGui::Text("Load Vp and Density files (.txt)");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // ---------------------------------------------------------
+            // 1. 选择纵波文件 (Vp)
+            // ---------------------------------------------------------
+            ImGui::Text("Vp File Path:");
+            // 显示当前路径，如果太长可能会被截断
+            ImGui::InputText("##vp", vpPath, sizeof(vpPath), ImGuiInputTextFlags_ReadOnly);
+            ImGui::SameLine();
+
+            // 按钮逻辑：调用封装好的 Windows API
+            if (ImGui::Button("Browse##1")) {
+                // 创建一个临时 buffer 或者是直接清空 vpPath
+                // 这里我们直接传入 vpPath，如果用户取消选择，内容不会变（取决于实现，最安全是先清空）
+                char tempBuffer[1024] = "";
+                if (OpenWindowsFileDialog(tempBuffer, 1024)) {
+                    // 如果选中了文件，更新路径
+                    strcpy_s(vpPath, tempBuffer);
+                }
+            }
+
+            ImGui::Spacing();
+
+            // ---------------------------------------------------------
+            // 2. 选择密度文件 (Rho)
+            // ---------------------------------------------------------
+            ImGui::Text("Density File Path:");
+            ImGui::InputText("##rho", rhoPath, sizeof(rhoPath), ImGuiInputTextFlags_ReadOnly);
+            ImGui::SameLine();
+
+            if (ImGui::Button("Browse##2")) {
+                char tempBuffer[1024] = "";
+                if (OpenWindowsFileDialog(tempBuffer, 1024)) {
+                    strcpy_s(rhoPath, tempBuffer);
+                }
+            }
+
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // ---------------------------------------------------------
+            // 3. 确认加载
+            // ---------------------------------------------------------
+            // 检查两个路径是否都不为空
+            bool isReady = (strlen(vpPath) > 0) && (strlen(rhoPath) > 0);
+
+            if (!isReady) ImGui::BeginDisabled();
+
+            if (ImGui::Button("LOAD MODEL", ImVec2(-1, 50))) {
+                // 调用之前的核心加载函数
+                // 此时 vpPath 和 rhoPath 已经包含了完整的 Windows 路径
+                if (loadModelFromData(engine, vpPath, rhoPath, fieldTex, modelTex)) {
+                    statusMsg = "Success: Model Loaded!";
+                    showWindow = false; // 关闭窗口
+                }
+                else {
+                    statusMsg = "Error: Failed to load files.";
+                }
+            }
+
+            if (!isReady) ImGui::EndDisabled();
+
+            if (!statusMsg.empty()) {
+                ImGui::TextColored(ImVec4(1, 1, 0, 1), "%s", statusMsg.c_str());
+            }
+
+            ImGui::End();
+        }
+    }
 }
 
 void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fieldTex, GLuint modelTex) {
@@ -1312,6 +1701,7 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
     // 窗口状态控制 (static 记忆状态)
     static bool show_control_panel = true;
     static bool show_overlay = true;
+    static bool showSuccessPopup = false; // <--- 这里定义缺少的变量
     // show_recorder_window 和 show_recorders_window 是全局变量
 
     if (showUI) {
@@ -1375,7 +1765,6 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                     }
                     // 补一个换行，防止最后的 SameLine 导致布局错乱
                     ImGui::NewLine();
-
                     ImGui::Separator();
                     ImGui::Text("Properties");
                     ImGui::SliderFloat("Brush Size", &brushRadiusPx, 5.0f, 100.0f);
@@ -1406,7 +1795,6 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                     ImGui::Checkbox("SwapInterval", &SwapInterval);
                     ImGui::EndTabItem();
                 }
-
                 // --------------------------------------------------------
                 // Tab 2: 设置 (Settings - 物理/网格)
                 // --------------------------------------------------------
@@ -1440,6 +1828,8 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                     ImGui::Text("Simulation Parameters");
                     ImGui::SliderInt("Freq (Hz)", &engine.currentFreq, 5, 300);
                     ImGui::SliderInt("Sim Speed/stepsPerFrame", &stepsPerFrame, 1, 50);
+                    ImGui::Separator();
+                    ImGui::Checkbox("SwapInterval", &SwapInterval);
 
                     ImGui::Separator();
                     ImGui::Text("Grid Resize");
@@ -1476,9 +1866,10 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                         engine.modelModified = true;
                     }
 
+                    RenderThreadControl();
+
                     ImGui::EndTabItem();
                 }
-
                 // --------------------------------------------------------
                 // Tab 3: 场景 (Scenarios - 恢复丢失的参数控制)
                 // --------------------------------------------------------
@@ -1514,396 +1905,461 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                     ImGui::SliderFloat("Min Vel", &minSpeed, 1000.0f, 3000.0f);
                     ImGui::SliderFloat("Max Vel", &maxSpeed, 3000.0f, 6000.0f);
 
-                    ImGui::EndTabItem();
-                }
+                    ///////////
+                    // 1. 定义状态变量 (如果之前没定义)
+                    static bool showSettingsWindow = false;
+                    static bool showSuccessPopup = false; // <--- 这里定义缺少的变量
 
-                // --------------------------------------------------------
-                // Tab 4: 视觉 (Visuals)
-                // --------------------------------------------------------
-                if (ImGui::BeginTabItem(" Visuals ")) {
-                    ImGui::Spacing();
-                    const char* modes[] = { "Liquid", "Heatmap", "Model", "Coolwarm", "Custom", "Jet", "Black-White",
-                                            "Frosted Glass", "Thin-Film", "Porcelain", "Terracotta", "Mercury", "Emissive", "Clay Wetness", "Metallic" };
-                    int modeIdx = (int)currentRenderMode;
-                    if (ImGui::Combo("Render Mode", &modeIdx, modes, IM_ARRAYSIZE(modes))) currentRenderMode = (RenderMode)modeIdx;
-
-                    ImGui::SliderFloat("Exposure", &displayGain, 0.0001f, 0.005f, "%.5f");
-                    if (ImGui::Button("Reset Exposure")) displayGain = 0.001f;
-
-                    if (currentRenderMode == RenderMode::CUSTOM) {
-                        ImGui::Spacing(); ImGui::Text("Custom Palette");
-                        ImGui::ColorEdit3("Positive", colPos); ImGui::ColorEdit3("Negative", colNeg); ImGui::ColorEdit3("Zero", colZero);
+                    if (ImGui::Button("System Settings & Export", ImVec2(-1, 0))) {
+                        showSettingsWindow = true;
                     }
-                    if (currentRenderMode == RenderMode::Clay_wetness) {
-                        ImGui::Spacing(); ImGui::Text("Custom Clay Palette");
-                        ImGui::ColorEdit3("ClayBase", colClayBase); ImGui::ColorEdit3("ClayDark", colClayDark);
-                        ImGui::ColorEdit3("mossColor", colmossColor); ImGui::SliderFloat("Clay_wetness", &wetness, 0.1f, 1.0f, "%.5f");
-                    }
-                    ImGui::Spacing(); ImGui::Text("Base Color-|");
-                    ImGui::ColorEdit3("colBaseColor", colBaseColor.data());
-                    ImGui::ColorEdit3("colHighColor", colHighColor.data());
-                    ImGui::ColorEdit3("colGridColor", colGridColor.data());
 
-                    ImGui::ColorEdit3("AbsorbColor", colAbsorbColor);
+                    if (showSettingsWindow) {
+                        ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
 
-                    if (ImGui::Button(" Reset_Color ", ImVec2(btnW, 35)))
-                    {
-                        colBaseColor = { 0.12f, 0.12f, 0.14f };
-                        colHighColor = { 0.12f * scale_fac, 0.12f * scale_fac, 0.14f * scale_fac };
-                        colGridColor = { 0.1f, 0.1f, 0.1f };
-                    };
+                        // 注意：传递 &showSettingsWindow 允许点击右上角 X 关闭
+                        if (ImGui::Begin("System Configuration", &showSettingsWindow)) {
 
-                    ImGui::Separator();
-                    ImGui::Text("Boundaries");
-                    bool bFree = engine.enableFreeSurface;
-                    if (ImGui::Checkbox("Free Surface (F)", &bFree)) { engine.toggleFreeSurface(); engine.toggleBoundary(); }
+                            // ... (这里是你之前的线程设置代码) ...
 
-                    bool bAbsorb = (engine.boundaryMode == 0);
-                    if (ImGui::Checkbox("Show Damp Layer", &bAbsorb)) engine.toggleBoundary();
+                            ImGui::Separator();
+                            ImGui::Text("Data Export");
 
-                    bool bHide = (engine.boundaryMode == 2);
-                    if (ImGui::Checkbox("Hide All", &bHide)) engine.hide_Boundary_damp();
+                            // 导出按钮
+                            if (ImGui::Button("Save Vp & Rho to Disk", ImVec2(-1.0f, 40.0f))) {
 
-                    ImGui::EndTabItem();
-                }
+                                // 1. 执行导出 (调用上一条回答中的函数)
+                                exportModelData(engine, "model_vp.txt", "model_density.txt");
 
-                ImGui::EndTabBar();
-            }
-            ImGui::End();
-        }
-        // ============================================================
-        // 3. 右上角状态浮窗 (Overlay) - 保持不变
-        // ============================================================
-        if (show_overlay) {
-            DrawStatusOverlay(&show_overlay, GRID_W, GRID_H, cursorX, cursorY, engine);
-        }
-        // ============================================================
-        // 4. 其他窗口 (示波器、阵列记录、截图提示) - 保持原有逻辑
-        // ============================================================
-        //单点检波器
-        if (show_recorder_window) {
-            ImGui::SetNextWindowPos(ImVec2(10, 800), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(500, 200), ImGuiCond_FirstUseEver);
-            ImGui::Begin("Oscilloscope", &show_recorder_window);
-            ImGui::SliderInt("History Len", &engine.recorder.maxHistory, 100, 2000);
-            if (engine.recorder.history.size() > 0) {
-                ImGui::PlotLines("##W", engine.recorder.history.data(), (int)engine.recorder.history.size(), 0, NULL, -5000.0f, 5000.0f, ImVec2(-1, 140));
-            }
-            ImGui::Text("Probe: (%d, %d)", engine.recorder.gx, engine.recorder.gy);
-            ImGui::End();
-        }
-        //检波器序列
-        if (show_recorders_window) {
-            ImGui::SetNextWindowPos(ImVec2(10, 1100), ImGuiCond_Once);
-            ImGui::SetNextWindowSize(ImVec2(520, 500), ImGuiCond_Once);
-            ImGui::Begin("Seismic Array Record", &show_recorders_window);
-            if (engine.receivers.empty()) {
-                ImGui::Text("No receivers active."); ImGui::Text("Select 'Array Tool', Click & Drag on the map to place receivers.");
-            }
-            /*else {
-                ImDrawList* draw_list = ImGui::GetWindowDrawList();
-                ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
-                ImVec2 canvas_size = ImGui::GetContentRegionAvail();
-                draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 25, 255));
-                draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
-                static float waveGain = 1.0f;
-                ImGui::SliderFloat("Gain", &waveGain, 0.1f, 10.0f);
-                float rowHeight = canvas_size.y / engine.receivers.size();
-                float timeStepWidth = canvas_size.x / engine.maxHistoryLen;
-                if (rowHeight < 5.0f) rowHeight = 5.0f;
-                ImGui::InvisibleButton("canvas", canvas_size);
+                                // 2. 【关键】触发弹窗标志
+                                showSuccessPopup = true;
+                            }
 
-                for (size_t i = 0; i < engine.receivers.size(); ++i) {
-                    const auto& r = engine.receivers[i];
-                    if (r.data.empty()) continue;
-                    float basePathY = canvas_pos.y + (i + 0.5f) * rowHeight;
-                    if (basePathY > canvas_pos.y + canvas_size.y) break;
-                    ImColor waveColor = ImColor(0.0f, 1.0f, 0.6f);
-                    for (size_t t = 0; t < r.data.size() - 1; ++t) {
-                        float x1 = canvas_pos.x + t * timeStepWidth;
-                        float y1 = basePathY - r.data[t] * waveGain * 0.05f;
-                        float x2 = canvas_pos.x + (t + 1) * timeStepWidth;
-                        float y2 = basePathY - r.data[t + 1] * waveGain * 0.05f;
-                        if (x1 < canvas_pos.x + canvas_size.x) draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.0f);
-                    }
-                    draw_list->AddLine(ImVec2(canvas_pos.x, basePathY), ImVec2(canvas_pos.x + canvas_size.x, basePathY), IM_COL32(50, 50, 60, 100));
-                    char label[16]; sprintf(label, "R%d", (int)i);
-                    draw_list->AddText(ImVec2(canvas_pos.x + 2, basePathY - 7), IM_COL32(150, 150, 150, 200), label);
-                }
-            }*/
-            //vertical
-            else {
-                // --- 1. 顶部控件区域 ---
-                // 先画滑块，让它占据顶部的空间
-                static float waveGain = 0.05f;
-                ImGui::SetNextItemWidth(200.0f); // 设置滑块宽度，不要太长
-                ImGui::SliderFloat("Gain", &waveGain, 0.01f, 1.0f);
-                ImGui::SameLine();
-                ImGui::TextDisabled("(?)");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adjust the amplitude of the seismic traces");
-                ImGui::SameLine();
-                float btnW = (ImGui::GetContentRegionAvail().x - 20) / 2;
-                if (ImGui::Button(" Reset_Gain ", ImVec2(btnW, 35))) { waveGain = 0.05f; };
-                ImGui::Separator(); // 画一条分割线
-
-                // --- 2. 画布区域计算 ---
-                ImDrawList* draw_list = ImGui::GetWindowDrawList();
-                ImVec2 canvas_pos = ImGui::GetCursorScreenPos(); // 获取滑块下方的起始位置
-                ImVec2 canvas_size = ImGui::GetContentRegionAvail(); // 获取剩余的全部空间
-
-                // 限制一下画布最小高度，防止出错
-                if (canvas_size.y < 50.0f) canvas_size.y = 50.0f;
-
-                // --- 3. 绘制背景和网格 ---
-                // 3.1 背景色
-                draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 25, 255));
-
-                // 3.2 限制绘图区域 (Clip Rect)
-                // 这一步非常重要！确保波形太强时不会画到滑块上面去
-                draw_list->PushClipRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), true);
-
-                // 3.3 绘制水平网格线 (时间深度网格)
-                int gridRows = 10; // 将Y轴分为10份
-                for (int r = 1; r < gridRows; ++r) {
-                    float y = canvas_pos.y + (canvas_size.y / gridRows) * r;
-                    // 画细淡的灰色横线
-                    draw_list->AddLine(
-                        ImVec2(canvas_pos.x, y),
-                        ImVec2(canvas_pos.x + canvas_size.x, y),
-                        IM_COL32(60, 60, 70, 80)
-                    );
-                }
-
-                // --- 4. 核心波形绘制逻辑 ---
-
-                // 定义左右边距 (Padding)
-                float paddingX = 20.0f;
-
-                // 计算可用宽度
-                float usableWidth = canvas_size.x - (paddingX * 2.0f);
-
-                // 计算每一道的宽度
-                float colWidth = usableWidth / engine.receivers.size();
-                float timeStepHeight = canvas_size.y / engine.maxHistoryLen;
-
-                // 占位按钮 (为了让 ImGui 知道这里有东西，支持鼠标滚轮等)
-                ImGui::InvisibleButton("canvas", canvas_size);
-
-                for (size_t i = 0; i < engine.receivers.size(); ++i) {
-                    const auto& r = engine.receivers[i];
-                    if (r.data.empty()) continue;
-
-                    // 计算当前道的基准 X 坐标
-                    // 公式：画布左边 + 左边距 + (第i个 * 宽度) + 半个宽度(居中)
-                    float basePathX = canvas_pos.x + paddingX + (i * colWidth) + (colWidth * 0.5f);
-
-                    ImColor waveColor = ImColor(0.0f, 1.0f, 0.6f);
-                    ImColor centerLineColor = IM_COL32(50, 50, 60, 150);
-
-                    // 绘制垂直基准线 (道中心线)
-                    draw_list->AddLine(
-                        ImVec2(basePathX, canvas_pos.y),
-                        ImVec2(basePathX, canvas_pos.y + canvas_size.y),
-                        centerLineColor
-                    );
-
-                    // 绘制波形 (Wiggle Trace)
-                    // 优化：步长设为2，减少一半的绘制点数，提高性能
-                    for (size_t t = 0; t < r.data.size() - 1; t += 1) {
-                        float y1 = canvas_pos.y + t * timeStepHeight;
-                        float y2 = canvas_pos.y + (t + 1) * timeStepHeight;
-
-                        // 振幅限制：防止单一波形过大覆盖了整个屏幕
-                        // 这里的 0.05f 是振幅缩放系数，可以根据需要微调
-                        float val1 = r.data[t] * waveGain * 0.15f;
-                        float val2 = r.data[t + 1] * waveGain * 0.15f;
-
-                        // 简单的钳制，防止画太远
-                        float maxDeviation = colWidth * 2.0f; // 允许波形稍微重叠，但不允许飞太远
-                        if (val1 > maxDeviation) val1 = maxDeviation;
-                        if (val1 < -maxDeviation) val1 = -maxDeviation;
-                        if (val2 > maxDeviation) val2 = maxDeviation;
-                        if (val2 < -maxDeviation) val2 = -maxDeviation;
-
-                        float x1 = basePathX + val1;
-                        float x2 = basePathX + val2;
-
-                        if (y1 < canvas_pos.y + canvas_size.y) {
-                            draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.5f); // 线条稍微加粗一点点 (1.5f)
+                            ImGui::End(); // 结束设置窗口
                         }
                     }
+                    // 1. 检查标志位，如果为真，告诉 ImGui 打开弹窗
+                    if (showSuccessPopup) {
+                        ImGui::OpenPopup("Export Completed"); // ID 必须与下面的 BeginPopupModal 一致
+                        showSuccessPopup = false; // 重置标志，防止每帧都重复 Open
+                    }
 
-                    // 绘制标签 (放在顶部)
-                    char label[16]; sprintf(label, "%d", (int)i);
-                    // 简单居中文字
-                    float textWidth = ImGui::CalcTextSize(label).x;
-                    draw_list->AddText(ImVec2(basePathX - textWidth * 0.5f, canvas_pos.y + 5), IM_COL32(200, 200, 200, 255), label);
+                    // 2. 设置弹窗居中显示
+                    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+                    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+                    // 3. 渲染模态弹窗 (Modal 表示背景不可点击)
+                    if (ImGui::BeginPopupModal("Export Completed", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                        // 弹窗内容
+                        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "Success!"); // 绿色文字
+                        ImGui::Separator();
+                        ImGui::Text("Model data has been saved to:");
+                        ImGui::TextDisabled("./model_vp.txt");
+                        ImGui::TextDisabled("./model_density.txt");
+                        ImGui::Spacing();
+
+                        // 确认按钮
+                        // 让按钮居中一点（简单的居中计算）
+                        ImGui::SetCursorPosX(winW * 0.5f);
+                        if (ImGui::Button("OK", ImVec2(120, 0))) {
+                            ImGui::CloseCurrentPopup(); // 点击后关闭弹窗
+                        }
+
+                        ImGui::EndPopup();
+                    }
+
+                    RenderNativeLoadPanel( engine, fieldTex,  modelTex);
+
+                    ImGui::EndTabItem();
+                    }
+                    // --------------------------------------------------------
+                    // Tab 4: 视觉 (Visuals)
+                    // --------------------------------------------------------
+                    if (ImGui::BeginTabItem(" Visuals ")) {
+                        ImGui::Spacing();
+                        const char* modes[] = { "Liquid", "Heatmap", "Model", "COOLWARM", "CUSTOM", "Jet", "Black-White",
+                            "Frosted Glass", "Thin-Film", "Porcelain","Clay_Terracotta",
+                            "PBR_Gold", "Hologram", "Clay_wetness", "Coolwarm_Metallic" };
+                        int modeIdx = (int)currentRenderMode;
+                        if (ImGui::Combo("Render Mode", &modeIdx, modes, IM_ARRAYSIZE(modes))) currentRenderMode = (RenderMode)modeIdx;
+
+                        ImGui::SliderFloat("Exposure", &displayGain, 0.0001f, 0.005f, "%.5f");
+                        if (ImGui::Button("Reset Exposure")) displayGain = 0.001f;
+
+                        if (currentRenderMode == RenderMode::CUSTOM) {
+                            ImGui::Spacing(); ImGui::Text("Custom Palette");
+                            ImGui::ColorEdit3("Positive", colPos); ImGui::ColorEdit3("Negative", colNeg); ImGui::ColorEdit3("Zero", colZero);
+                        }
+                        if (currentRenderMode == RenderMode::Clay_wetness) {
+                            ImGui::Spacing(); ImGui::Text("Custom Clay Palette");
+                            ImGui::ColorEdit3("ClayBase", colClayBase); ImGui::ColorEdit3("ClayDark", colClayDark);
+                            ImGui::ColorEdit3("mossColor", colmossColor); ImGui::SliderFloat("Clay_wetness", &wetness, 0.1f, 1.0f, "%.5f");
+                        }
+                        ImGui::Spacing(); ImGui::Text("Base groundColor.");
+                        ImGui::ColorEdit3("colBaseColor", colBaseColor.data());
+                        ImGui::ColorEdit3("colHighColor", colHighColor.data());
+                        ImGui::ColorEdit3("colGridColor", colGridColor.data());
+
+                        ImGui::ColorEdit3("AbsorbColor", colAbsorbColor);
+
+                        if (ImGui::Button(" Reset_Color ", ImVec2(btnW, 35)))
+                        {
+                            colBaseColor = { 0.12f, 0.12f, 0.14f };
+                            colHighColor = { 0.12f * scale_fac, 0.12f * scale_fac, 0.14f * scale_fac };
+                            colGridColor = { 0.1f, 0.1f, 0.1f };
+                        };
+
+                        ImGui::Separator();
+                        ImGui::Text("Boundaries");
+                        bool bFree = engine.enableFreeSurface;
+                        if (ImGui::Checkbox("Free Surface (F)", &bFree)) { engine.toggleFreeSurface(); engine.toggleBoundary(); }
+
+                        bool bAbsorb = (engine.boundaryMode == 0);
+                        if (ImGui::Checkbox("Show Damp Layer", &bAbsorb)) engine.toggleBoundary();
+
+                        bool bHide = (engine.boundaryMode == 2);
+                        if (ImGui::Checkbox("Hide All", &bHide)) engine.hide_Boundary_damp();
+
+                        ImGui::EndTabItem();
+                    }
+
+                    ImGui::EndTabBar();
                 }
-
-                // 绘制外边框
-                draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
-
-                // 结束裁剪
-                draw_list->PopClipRect();
+                ImGui::End();
             }
-            ImGui::End();
-
-            float scaleX = (float)vp.w / GRID_W;
-            float scaleY = (float)vp.h / GRID_H;
-            float screenOriginX = vp.screenX;
-            float screenOriginY = vp.screenY;
-            // 注意：process_input 里 vp.screenY 是反的(相对于底部的)，但ImGui绘图是相对于顶部的
-            // 正确的 ImGui Y = 窗口高度 - (glY + glH) + (GRID_H - gy)*scaleY ... 有点复杂
-            // 最简单的方法：利用TexCoord映射。
-            // OpenGL渲染时: TexCoord (0,0) 在左下角(物理内存开头)，但Shader里做了 TexCoord.y = 1.0 - TexCoord.y 翻转。
-            // 我们的 grid (0,0) 是内存开头 (top-left in standard image processing, but bottom-left in physics usually).
-            // 让我们看代码: int idx = y * GRID_W + x; 
-            // process_input 中: relY = my - vp.screenY; normY = relY / vp.h;
-            // 所以 grid (0,0) 对应屏幕顶部。
-
-            // 修正 ImGui 绘图的 Origin
-            ImVec2 glScreenPos(vp.x, vp.y); // 这是 OpenGL Viewport 左上角在窗口中的位置
-
-            ImDrawList* fg_list = ImGui::GetForegroundDrawList();
-
-            // 定义样式参数
-            const float geoSize = 12.0f; // 检波器图标大小
-            const ImU32 colCable = IM_COL32(200, 200, 200, 180); // 线缆颜色
-            const ImU32 colGeoFill = IM_COL32(255, 140, 0, 255); // 检波器填充 (深橙色)
-            const ImU32 colGeoBorder = IM_COL32(0, 0, 0, 255);   // 检波器描边 (黑色)
-            const ImU32 colPreview = IM_COL32(255, 255, 0, 150); // 预览颜色
-
-            // 1. 绘制已放置的检波器 (倒三角形 + 线缆)
-            if (!engine.receivers.empty()) {
-                // A. 先画线缆 (连接所有检波器)
-                // 为了性能，我们不画几百条线段，而是简单地画一条贯穿首尾的线（假设是直线阵列）
-                // 如果阵列是弯曲的，则需要循环画线。这里假设是直线工具生成的：
-                if (engine.receivers.size() > 1) {
-                    const auto& rFirst = engine.receivers.front();
-                    const auto& rLast = engine.receivers.back();
-                    ImVec2 p1(glScreenPos.x + rFirst.gx * scaleX, glScreenPos.y + rFirst.gy * scaleY);
-                    ImVec2 p2(glScreenPos.x + rLast.gx * scaleX, glScreenPos.y + rLast.gy * scaleY);
-                    fg_list->AddLine(p1, p2, colCable, 2.0f);
+            // ============================================================
+            // 3. 右上角状态浮窗 (Overlay) - 保持不变
+            // ============================================================
+            if (show_overlay) {
+                DrawStatusOverlay(&show_overlay, GRID_W, GRID_H, cursorX, cursorY, engine);
+            }
+            // ============================================================
+            // 4. 其他窗口 (示波器、阵列记录、截图提示) - 保持原有逻辑
+            // ============================================================
+            //单点检波器
+            if (show_recorder_window) {
+                ImGui::SetNextWindowPos(ImVec2(10, 800), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(500, 200), ImGuiCond_FirstUseEver);
+                ImGui::Begin("Oscilloscope", &show_recorder_window);
+                ImGui::SliderInt("History Len", &engine.recorder.maxHistory, 100, 2000);
+                if (engine.recorder.history.size() > 0) {
+                    ImGui::PlotLines("##W", engine.recorder.history.data(), (int)engine.recorder.history.size(), 0, NULL, -5000.0f, 5000.0f, ImVec2(-1, 140));
                 }
+                ImGui::Text("Probe: (%d, %d)", engine.recorder.gx, engine.recorder.gy);
+                ImGui::End();
+            }
+            //检波器序列
+            if (show_recorders_window) {
+                ImGui::SetNextWindowPos(ImVec2(10, 1100), ImGuiCond_Once);
+                ImGui::SetNextWindowSize(ImVec2(520, 500), ImGuiCond_Once);
+                ImGui::Begin("Seismic Array Record", &show_recorders_window);
+                if (engine.receivers.empty()) {
+                    ImGui::Text("No receivers active."); ImGui::Text("Select 'Array Tool', Click & Drag on the map to place receivers.");
+                }
+                /*else {
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+                    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+                    draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 25, 255));
+                    draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
+                    static float waveGain = 1.0f;
+                    ImGui::SliderFloat("Gain", &waveGain, 0.1f, 10.0f);
+                    float rowHeight = canvas_size.y / engine.receivers.size();
+                    float timeStepWidth = canvas_size.x / engine.maxHistoryLen;
+                    if (rowHeight < 5.0f) rowHeight = 5.0f;
+                    ImGui::InvisibleButton("canvas", canvas_size);
 
-                // B. 再画检波器图标 (倒三角)
-                for (size_t i = 0; i < engine.receivers.size(); ++i) {
-                    const auto& r = engine.receivers[i];
-                    float px = glScreenPos.x + r.gx * scaleX;
-                    float py = glScreenPos.y + r.gy * scaleY;
+                    for (size_t i = 0; i < engine.receivers.size(); ++i) {
+                        const auto& r = engine.receivers[i];
+                        if (r.data.empty()) continue;
+                        float basePathY = canvas_pos.y + (i + 0.5f) * rowHeight;
+                        if (basePathY > canvas_pos.y + canvas_size.y) break;
+                        ImColor waveColor = ImColor(0.0f, 1.0f, 0.6f);
+                        for (size_t t = 0; t < r.data.size() - 1; ++t) {
+                            float x1 = canvas_pos.x + t * timeStepWidth;
+                            float y1 = basePathY - r.data[t] * waveGain * 0.05f;
+                            float x2 = canvas_pos.x + (t + 1) * timeStepWidth;
+                            float y2 = basePathY - r.data[t + 1] * waveGain * 0.05f;
+                            if (x1 < canvas_pos.x + canvas_size.x) draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.0f);
+                        }
+                        draw_list->AddLine(ImVec2(canvas_pos.x, basePathY), ImVec2(canvas_pos.x + canvas_size.x, basePathY), IM_COL32(50, 50, 60, 100));
+                        char label[16]; sprintf(label, "R%d", (int)i);
+                        draw_list->AddText(ImVec2(canvas_pos.x + 2, basePathY - 7), IM_COL32(150, 150, 150, 200), label);
+                    }
+                }*/
+                //vertical
+                else {
+                    // --- 1. 顶部控件区域 ---
+                    // 先画滑块，让它占据顶部的空间
+                    static float waveGain = 0.05f;
+                    ImGui::SetNextItemWidth(200.0f); // 设置滑块宽度，不要太长
+                    ImGui::SliderFloat("Gain", &waveGain, 0.01f, 1.0f);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adjust the amplitude of the seismic traces");
+                    ImGui::SameLine();
+                    float btnW = (ImGui::GetContentRegionAvail().x - 20) / 2;
+                    if (ImGui::Button(" Reset_Gain ", ImVec2(btnW, 35))) { waveGain = 0.05f; };
+                    ImGui::Separator(); // 画一条分割线
 
-                    // 倒三角形顶点计算
-                    ImVec2 pTopLeft(px - geoSize * 0.7f, py - geoSize * 0.7f);
-                    ImVec2 pTopRight(px + geoSize * 0.7f, py - geoSize * 0.7f);
-                    ImVec2 pBottom(px, py + geoSize);
+                    // --- 2. 画布区域计算 ---
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+                    ImVec2 canvas_pos = ImGui::GetCursorScreenPos(); // 获取滑块下方的起始位置
+                    ImVec2 canvas_size = ImGui::GetContentRegionAvail(); // 获取剩余的全部空间
 
-                    fg_list->AddTriangleFilled(pTopLeft, pTopRight, pBottom, colGeoFill);
-                    fg_list->AddTriangle(pTopLeft, pTopRight, pBottom, colGeoBorder);
+                    // 限制一下画布最小高度，防止出错
+                    if (canvas_size.y < 50.0f) canvas_size.y = 50.0f;
 
-                    // 可选：绘制首尾编号
-                    if (i == 0 || i == engine.receivers.size() - 1) {
-                        char idText[8]; sprintf(idText, "%d", (int)i);
-                        fg_list->AddText(ImVec2(px + 8, py - 8), IM_COL32(255, 255, 255, 200), idText);
+                    // --- 3. 绘制背景和网格 ---
+                    // 3.1 背景色
+                    draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(20, 20, 25, 255));
+
+                    // 3.2 限制绘图区域 (Clip Rect)
+                    // 这一步非常重要！确保波形太强时不会画到滑块上面去
+                    draw_list->PushClipRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), true);
+
+                    // 3.3 绘制水平网格线 (时间深度网格)
+                    int gridRows = 10; // 将Y轴分为10份
+                    for (int r = 1; r < gridRows; ++r) {
+                        float y = canvas_pos.y + (canvas_size.y / gridRows) * r;
+                        // 画细淡的灰色横线
+                        draw_list->AddLine(
+                            ImVec2(canvas_pos.x, y),
+                            ImVec2(canvas_pos.x + canvas_size.x, y),
+                            IM_COL32(60, 60, 70, 80)
+                        );
+                    }
+
+                    // --- 4. 核心波形绘制逻辑 ---
+
+                    // 定义左右边距 (Padding)
+                    float paddingX = 20.0f;
+
+                    // 计算可用宽度
+                    float usableWidth = canvas_size.x - (paddingX * 2.0f);
+
+                    // 计算每一道的宽度
+                    float colWidth = usableWidth / engine.receivers.size();
+                    float timeStepHeight = canvas_size.y / engine.maxHistoryLen;
+
+                    // 占位按钮 (为了让 ImGui 知道这里有东西，支持鼠标滚轮等)
+                    ImGui::InvisibleButton("canvas", canvas_size);
+
+                    for (size_t i = 0; i < engine.receivers.size(); ++i) {
+                        const auto& r = engine.receivers[i];
+                        if (r.data.empty()) continue;
+
+                        // 计算当前道的基准 X 坐标
+                        // 公式：画布左边 + 左边距 + (第i个 * 宽度) + 半个宽度(居中)
+                        float basePathX = canvas_pos.x + paddingX + (i * colWidth) + (colWidth * 0.5f);
+
+                        ImColor waveColor = ImColor(0.0f, 1.0f, 0.6f);
+                        ImColor centerLineColor = IM_COL32(50, 50, 60, 150);
+
+                        // 绘制垂直基准线 (道中心线)
+                        draw_list->AddLine(
+                            ImVec2(basePathX, canvas_pos.y),
+                            ImVec2(basePathX, canvas_pos.y + canvas_size.y),
+                            centerLineColor
+                        );
+
+                        // 绘制波形 (Wiggle Trace)
+                        // 优化：步长设为2，减少一半的绘制点数，提高性能
+                        for (size_t t = 0; t < r.data.size() - 1; t += 1) {
+                            float y1 = canvas_pos.y + t * timeStepHeight;
+                            float y2 = canvas_pos.y + (t + 1) * timeStepHeight;
+
+                            // 振幅限制：防止单一波形过大覆盖了整个屏幕
+                            // 这里的 0.05f 是振幅缩放系数，可以根据需要微调
+                            float val1 = r.data[t] * waveGain * 0.15f;
+                            float val2 = r.data[t + 1] * waveGain * 0.15f;
+
+                            // 简单的钳制，防止画太远
+                            float maxDeviation = colWidth * 2.0f; // 允许波形稍微重叠，但不允许飞太远
+                            if (val1 > maxDeviation) val1 = maxDeviation;
+                            if (val1 < -maxDeviation) val1 = -maxDeviation;
+                            if (val2 > maxDeviation) val2 = maxDeviation;
+                            if (val2 < -maxDeviation) val2 = -maxDeviation;
+
+                            float x1 = basePathX + val1;
+                            float x2 = basePathX + val2;
+
+                            if (y1 < canvas_pos.y + canvas_size.y) {
+                                draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.5f); // 线条稍微加粗一点点 (1.5f)
+                            }
+                        }
+
+                        // 绘制标签 (放在顶部)
+                        char label[16]; sprintf(label, "%d", (int)i);
+                        // 简单居中文字
+                        float textWidth = ImGui::CalcTextSize(label).x;
+                        draw_list->AddText(ImVec2(basePathX - textWidth * 0.5f, canvas_pos.y + 5), IM_COL32(200, 200, 200, 255), label);
+                    }
+
+                    // 绘制外边框
+                    draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
+
+                    // 结束裁剪
+                    draw_list->PopClipRect();
+                }
+                ImGui::End();
+
+                float scaleX = (float)vp.w / GRID_W;
+                float scaleY = (float)vp.h / GRID_H;
+                float screenOriginX = vp.screenX;
+                float screenOriginY = vp.screenY;
+                // 注意：process_input 里 vp.screenY 是反的(相对于底部的)，但ImGui绘图是相对于顶部的
+                // 正确的 ImGui Y = 窗口高度 - (glY + glH) + (GRID_H - gy)*scaleY ... 有点复杂
+                // 最简单的方法：利用TexCoord映射。
+                // OpenGL渲染时: TexCoord (0,0) 在左下角(物理内存开头)，但Shader里做了 TexCoord.y = 1.0 - TexCoord.y 翻转。
+                // 我们的 grid (0,0) 是内存开头 (top-left in standard image processing, but bottom-left in physics usually).
+                // 让我们看代码: int idx = y * GRID_W + x; 
+                // process_input 中: relY = my - vp.screenY; normY = relY / vp.h;
+                // 所以 grid (0,0) 对应屏幕顶部。
+
+                // 修正 ImGui 绘图的 Origin
+                ImVec2 glScreenPos(vp.x, vp.y); // 这是 OpenGL Viewport 左上角在窗口中的位置
+
+                ImDrawList* fg_list = ImGui::GetForegroundDrawList();
+
+                // 定义样式参数
+                const float geoSize = 12.0f; // 检波器图标大小
+                const ImU32 colCable = IM_COL32(200, 200, 200, 180); // 线缆颜色
+                const ImU32 colGeoFill = IM_COL32(255, 140, 0, 255); // 检波器填充 (深橙色)
+                const ImU32 colGeoBorder = IM_COL32(0, 0, 0, 255);   // 检波器描边 (黑色)
+                const ImU32 colPreview = IM_COL32(255, 255, 0, 150); // 预览颜色
+
+                // 1. 绘制已放置的检波器 (倒三角形 + 线缆)
+                if (!engine.receivers.empty()) {
+                    // A. 先画线缆 (连接所有检波器)
+                    // 为了性能，我们不画几百条线段，而是简单地画一条贯穿首尾的线（假设是直线阵列）
+                    // 如果阵列是弯曲的，则需要循环画线。这里假设是直线工具生成的：
+                    if (engine.receivers.size() > 1) {
+                        const auto& rFirst = engine.receivers.front();
+                        const auto& rLast = engine.receivers.back();
+                        ImVec2 p1(glScreenPos.x + rFirst.gx * scaleX, glScreenPos.y + rFirst.gy * scaleY);
+                        ImVec2 p2(glScreenPos.x + rLast.gx * scaleX, glScreenPos.y + rLast.gy * scaleY);
+                        fg_list->AddLine(p1, p2, colCable, 2.0f);
+                    }
+
+                    // B. 再画检波器图标 (倒三角)
+                    for (size_t i = 0; i < engine.receivers.size(); ++i) {
+                        const auto& r = engine.receivers[i];
+                        float px = glScreenPos.x + r.gx * scaleX;
+                        float py = glScreenPos.y + r.gy * scaleY;
+
+                        // 倒三角形顶点计算
+                        ImVec2 pTopLeft(px - geoSize * 0.7f, py - geoSize * 0.7f);
+                        ImVec2 pTopRight(px + geoSize * 0.7f, py - geoSize * 0.7f);
+                        ImVec2 pBottom(px, py + geoSize);
+
+                        fg_list->AddTriangleFilled(pTopLeft, pTopRight, pBottom, colGeoFill);
+                        fg_list->AddTriangle(pTopLeft, pTopRight, pBottom, colGeoBorder);
+
+                        // 可选：绘制首尾编号
+                        if (i == 0 || i == engine.receivers.size() - 1) {
+                            char idText[8]; sprintf(idText, "%d", (int)i);
+                            fg_list->AddText(ImVec2(px + 8, py - 8), IM_COL32(255, 255, 255, 200), idText);
+                        }
                     }
                 }
-            }
 
-            // 2. 绘制拖拽过程中的预览 (虚影)
-            if (isDraggingArray && currentTool == ToolMode::PLACE_ARRAY) {
-                float startPx = glScreenPos.x + dragStartX * scaleX;
-                float startPy = glScreenPos.y + dragStartY * scaleY;
-                float endPx = glScreenPos.x + cursorX * GRID_W * scaleX;
-                float endPy = glScreenPos.y + cursorY * GRID_H * scaleY;
+                // 2. 绘制拖拽过程中的预览 (虚影)
+                if (isDraggingArray && currentTool == ToolMode::PLACE_ARRAY) {
+                    float startPx = glScreenPos.x + dragStartX * scaleX;
+                    float startPy = glScreenPos.y + dragStartY * scaleY;
+                    float endPx = glScreenPos.x + cursorX * GRID_W * scaleX;
+                    float endPy = glScreenPos.y + cursorY * GRID_H * scaleY;
 
-                // 绘制预览中轴线
-                fg_list->AddLine(ImVec2(startPx, startPy), ImVec2(endPx, endPy), colPreview, 1.0f);
+                    // 绘制预览中轴线
+                    fg_list->AddLine(ImVec2(startPx, startPy), ImVec2(endPx, endPy), colPreview, 1.0f);
 
-                // 显示总数标签
-                char countLabel[32];
-                sprintf(countLabel, "Count: %d", arrayReceiverCount);
-                fg_list->AddText(ImVec2(endPx + 10, endPy + 10), IM_COL32(255, 255, 0, 255), countLabel);
+                    // 显示总数标签
+                    char countLabel[32];
+                    sprintf(countLabel, "Count: %d", arrayReceiverCount);
+                    fg_list->AddText(ImVec2(endPx + 10, endPy + 10), IM_COL32(255, 255, 0, 255), countLabel);
 
-                // 绘制预览点
-                int count = arrayReceiverCount;
-                for (int i = 0; i < count; ++i) {
-                    float t = (count == 1) ? 0.0f : (float)i / (count - 1);
-                    float tx = startPx + (endPx - startPx) * t;
-                    float ty = startPy + (endPy - startPy) * t;
+                    // 绘制预览点
+                    int count = arrayReceiverCount;
+                    for (int i = 0; i < count; ++i) {
+                        float t = (count == 1) ? 0.0f : (float)i / (count - 1);
+                        float tx = startPx + (endPx - startPx) * t;
+                        float ty = startPy + (endPy - startPy) * t;
 
-                    // 预览用简单的圆形或半透明三角
-                    fg_list->AddCircleFilled(ImVec2(tx, ty), 3.0f, colPreview);
+                        // 预览用简单的圆形或半透明三角
+                        fg_list->AddCircleFilled(ImVec2(tx, ty), 3.0f, colPreview);
+                    }
+
+                    // 绘制起点和终点的十字准星，辅助对齐
+                    fg_list->AddLine(ImVec2(startPx - 5, startPy), ImVec2(startPx + 5, startPy), colPreview);
+                    fg_list->AddLine(ImVec2(startPx, startPy - 5), ImVec2(startPx, startPy + 5), colPreview);
+                    fg_list->AddLine(ImVec2(endPx - 5, endPy), ImVec2(endPx + 5, endPy), colPreview);
+                    fg_list->AddLine(ImVec2(endPx, endPy - 5), ImVec2(endPx, endPy + 5), colPreview);
                 }
+                // ==========================================
+    // 新增: 3. 绘制波场刻度尺 (Rulers)
+    // ==========================================
+                {
+                    const int rulerStep = 50;       // 刻度间隔
+                    const float tickLen = 6.0f;     // 刻度线长度
+                    const float textOffset = 15.0f; // 文字偏移
+                    const ImU32 colRuler = IM_COL32(220, 220, 220, 180);
 
-                // 绘制起点和终点的十字准星，辅助对齐
-                fg_list->AddLine(ImVec2(startPx - 5, startPy), ImVec2(startPx + 5, startPy), colPreview);
-                fg_list->AddLine(ImVec2(startPx, startPy - 5), ImVec2(startPx, startPy + 5), colPreview);
-                fg_list->AddLine(ImVec2(endPx - 5, endPy), ImVec2(endPx + 5, endPy), colPreview);
-                fg_list->AddLine(ImVec2(endPx, endPy - 5), ImVec2(endPx, endPy + 5), colPreview);
-            }
-            // ==========================================
-// 新增: 3. 绘制波场刻度尺 (Rulers)
-// ==========================================
-            {
-                const int rulerStep = 50;       // 刻度间隔
-                const float tickLen = 6.0f;     // 刻度线长度
-                const float textOffset = 15.0f; // 文字偏移
-                const ImU32 colRuler = IM_COL32(220, 220, 220, 180);
+                    // --- A. 顶部 X 轴刻度 (移至网格 Y=50 处) ---
+                    // 计算网格 Y=50 对应的屏幕垂直坐标
+                    float topRulerY = glScreenPos.y + 50.0f * scaleY;
 
-                // --- A. 顶部 X 轴刻度 (移至网格 Y=50 处) ---
-                // 计算网格 Y=50 对应的屏幕垂直坐标
-                float topRulerY = glScreenPos.y + 50.0f * scaleY;
+                    for (int x = 0; x <= GRID_W; x += rulerStep) {
+                        float px = glScreenPos.x + x * scaleX;
+                        float py = topRulerY;
 
-                for (int x = 0; x <= GRID_W; x += rulerStep) {
-                    float px = glScreenPos.x + x * scaleX;
-                    float py = topRulerY;
+                        // 1. 绘制刻度短线 (向上伸出)
+                        fg_list->AddLine(ImVec2(px, py), ImVec2(px, py - tickLen), colRuler, 1.5f);
 
-                    // 1. 绘制刻度短线 (向上伸出)
-                    fg_list->AddLine(ImVec2(px, py), ImVec2(px, py - tickLen), colRuler, 1.5f);
+                        // 2. 绘制数字 (显示在 Y=50 线条的上方)
+                        char num[16]; sprintf(num, "%d", x);
+                        float txtW = ImGui::CalcTextSize(num).x;
+                        fg_list->AddText(ImVec2(px - txtW * 0.5f, py - tickLen - textOffset), colRuler, num);
+                    }
 
-                    // 2. 绘制数字 (显示在 Y=50 线条的上方)
-                    char num[16]; sprintf(num, "%d", x);
-                    float txtW = ImGui::CalcTextSize(num).x;
-                    fg_list->AddText(ImVec2(px - txtW * 0.5f, py - tickLen - textOffset), colRuler, num);
+                    // 绘制一条横贯的基准线 (在 Y=50 处)
+                    fg_list->AddLine(ImVec2(glScreenPos.x, topRulerY), ImVec2(glScreenPos.x + vp.w, topRulerY), colRuler);
+
+
+                    // --- B. 左侧 Y 轴刻度 (保持在最左侧) ---
+                    for (int y = 0; y <= GRID_H; y += rulerStep) {
+                        float px = glScreenPos.x;
+                        float py = glScreenPos.y + y * scaleY;
+
+                        // 1. 绘制刻度短线
+                        fg_list->AddLine(ImVec2(px, py), ImVec2(px - tickLen, py), colRuler, 1.5f);
+
+                        // 2. 绘制数字
+                        char num[16]; sprintf(num, "%d", y);
+                        float txtW = ImGui::CalcTextSize(num).x;
+                        float txtH = ImGui::CalcTextSize(num).y;
+                        fg_list->AddText(ImVec2(px - tickLen - txtW - 4.0f, py - txtH * 0.5f), colRuler, num);
+                    }
+
+                    // --- C. 绘制左边框线 (顶边框已经由上面的基准线代替了) ---
+                    fg_list->AddLine(glScreenPos, ImVec2(glScreenPos.x, glScreenPos.y + vp.h), colRuler);
                 }
-
-                // 绘制一条横贯的基准线 (在 Y=50 处)
-                fg_list->AddLine(ImVec2(glScreenPos.x, topRulerY), ImVec2(glScreenPos.x + vp.w, topRulerY), colRuler);
-
-
-                // --- B. 左侧 Y 轴刻度 (保持在最左侧) ---
-                for (int y = 0; y <= GRID_H; y += rulerStep) {
-                    float px = glScreenPos.x;
-                    float py = glScreenPos.y + y * scaleY;
-
-                    // 1. 绘制刻度短线
-                    fg_list->AddLine(ImVec2(px, py), ImVec2(px - tickLen, py), colRuler, 1.5f);
-
-                    // 2. 绘制数字
-                    char num[16]; sprintf(num, "%d", y);
-                    float txtW = ImGui::CalcTextSize(num).x;
-                    float txtH = ImGui::CalcTextSize(num).y;
-                    fg_list->AddText(ImVec2(px - tickLen - txtW - 4.0f, py - txtH * 0.5f), colRuler, num);
+            }
+            // 截图提示框
+            if (glfwGetTime() - saveMsgStartTime < SAVE_MSG_DURATION) {
+                ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, 0.0f), ImVec2(500.0f, 1000.0f));
+                ImGui::SetNextWindowPos(ImVec2(winW * 0.5f, 100.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+                ImGui::SetNextWindowBgAlpha(0.8f);
+                if (ImGui::Begin("SaveToast", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[SUCCESS]"); ImGui::SameLine(); ImGui::Text("Screenshot Saved!");
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Path:"); ImGui::SameLine(); ImGui::TextWrapped("%s", lastSavedPath.c_str());
                 }
-
-                // --- C. 绘制左边框线 (顶边框已经由上面的基准线代替了) ---
-                fg_list->AddLine(glScreenPos, ImVec2(glScreenPos.x, glScreenPos.y + vp.h), colRuler);
+                ImGui::End();
             }
-        }
-        // 截图提示框
-        if (glfwGetTime() - saveMsgStartTime < SAVE_MSG_DURATION) {
-            ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, 0.0f), ImVec2(500.0f, 1000.0f));
-            ImGui::SetNextWindowPos(ImVec2(winW * 0.5f, 100.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-            ImGui::SetNextWindowBgAlpha(0.8f);
-            if (ImGui::Begin("SaveToast", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "[SUCCESS]"); ImGui::SameLine(); ImGui::Text("Screenshot Saved!");
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Path:"); ImGui::SameLine(); ImGui::TextWrapped("%s", lastSavedPath.c_str());
-            }
-            ImGui::End();
         }
     }
-
-}
 // ==========================================
 // 6. 主程序入口
 // ==========================================
@@ -1912,7 +2368,7 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
+    glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
     GLFWwindow* window = glfwCreateWindow(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, "Acoustic Wave Pro (Ultimate)", NULL, NULL);
     if (!window) return -1;
 
@@ -1964,6 +2420,13 @@ int main() {
 
     //手册输出
     Manual_print();
+
+
+    std::cout << "Detected CPU Threads: " << omp_get_max_threads() << std::endl;
+    std::cout << ">>> OpenMP Enabled." << std::endl;
+    static int threadCount = omp_get_max_threads(); // 默认设为最大值
+    // 设置接下来使用 8 个线程
+    omp_set_num_threads(8);
 
     int stepsPerFrame = 1;
     auto lastT = std::chrono::high_resolution_clock::now();
@@ -2028,6 +2491,8 @@ int main() {
         glUniform1f(glGetUniformLocation(prog, "wetness"), wetness);
         glUniform3f(glGetUniformLocation(prog, "colClayBase"), colClayBase[0], colClayBase[1], colClayBase[2]);
         glUniform3f(glGetUniformLocation(prog, "colClayDark"), colClayDark[0], colClayDark[1], colClayDark[2]);
+        glUniform3f(glGetUniformLocation(prog, "colmossColor"), colmossColor[0], colmossColor[1], colmossColor[2]);
+        
         glUniform3f(glGetUniformLocation(prog, "colAbsorbColor"), colAbsorbColor[0], colAbsorbColor[1], colAbsorbColor[2]);
 
         glUniform3f(glGetUniformLocation(prog, "colBaseColor"), colBaseColor[0], colBaseColor[1], colBaseColor[2]);

@@ -364,61 +364,6 @@ void main() {
         float opacity = smoothstep(0.05, 0.2, abs(val));
         color = mix(bg, color, opacity);
     }
-    // === Mode 3: Metallic Coolwarm Relief ===
-    else if (mode == 14) {
-        // 1. 数据准备
-        float val = clamp(p * visualGain * 1.5, -1.0, 1.0);
-        float absVal = abs(val);
-
-        // 2. 增强立体感的法线
-        // Z值从1.0改为0.5，让波浪的起伏更“陡峭”，浮雕感更强
-        vec3 normal = normalize(vec3(-grad.x, -grad.y, 0.5));
-
-        // 3. 光照设置
-        vec3 lightDir = normalize(vec3(-0.8, 0.8, 1.0));
-        vec3 viewDir = vec3(0.0, 0.0, 1.0);
-        vec3 halfDir = normalize(lightDir + viewDir);
-
-        // 4. 获取 Coolwarm 基础色
-        // (假设 getCoolWarmColor 函数已存在)
-        vec3 baseColor = getCoolWarmColor(val);
-
-        // 5. 光照计算
-        // 漫反射 (Diffuse Shading)
-        float diff = max(dot(normal, lightDir), 0.0);
-
-        // 镜面高光 (Specular Highlight) -> 模拟金属光泽
-        // 指数 32.0 产生较宽的高光，像拉丝金属
-        float spec = pow(max(dot(normal, halfDir), 0.0), 32.0);
-
-        // 动态阴影 (Dynamic Shadow)
-        // 梯度越大 (波越陡)，阴影越深
-        float shadow = 1.0 - smoothstep(0.5, 3.0, gradLen);
-
-        // 6. 合成
-        // a. 基础色 + 漫反射 (给颜色加上明暗)
-        vec3 finalColor = baseColor * (0.5 + 0.5 * diff);
-
-        // b. 叠加高光 (只在高亮处叠加纯白色)
-        // 乘以 absVal，确保只有波纹起伏的地方才有高光，平坦处没有
-        finalColor += vec3(1.0) * spec * 0.7 * absVal;
-
-        // c. 应用阴影
-        finalColor *= shadow;
-
-        // 7. 透明度混合
-        // 锐化透明度过渡，让波纹边缘更清晰
-        float opacity = smoothstep(0.02, 0.1, absVal);
-
-        if (isWall) {
-            // 让墙体显示为深灰色金属，并能反射波的光芒
-            float wallShade = max(dot(vec3(0, 0, 1), lightDir), 0.0);
-            color = vec3(0.15) * (0.5 + 0.5 * wallShade) + baseColor * spec * 0.5;
-        }
-        else {
-            color = mix(bg, finalColor, opacity);
-        }
-    }
     // === Mode 4: Custom 3-Color Map ===
     else if (mode == 4) {
         float val = clamp(p * visualGain * 2.0, -1.0, 1.0);
@@ -727,6 +672,61 @@ void main() {
         }
         else {
             color = mix(bg, clayFinal, opacity);
+        }
+    }
+    // === Mode 3: Metallic Coolwarm Relief ===
+    else if (mode == 14) {
+        // 1. 数据准备
+        float val = clamp(p * visualGain * 1.5, -1.0, 1.0);
+        float absVal = abs(val);
+
+        // 2. 增强立体感的法线
+        // Z值从1.0改为0.5，让波浪的起伏更“陡峭”，浮雕感更强
+        vec3 normal = normalize(vec3(-grad.x, -grad.y, 0.5));
+
+        // 3. 光照设置
+        vec3 lightDir = normalize(vec3(-0.8, 0.8, 1.0));
+        vec3 viewDir = vec3(0.0, 0.0, 1.0);
+        vec3 halfDir = normalize(lightDir + viewDir);
+
+        // 4. 获取 Coolwarm 基础色
+        // (假设 getCoolWarmColor 函数已存在)
+        vec3 baseColor = getCoolWarmColor(val);
+
+        // 5. 光照计算
+        // 漫反射 (Diffuse Shading)
+        float diff = max(dot(normal, lightDir), 0.0);
+
+        // 镜面高光 (Specular Highlight) -> 模拟金属光泽
+        // 指数 32.0 产生较宽的高光，像拉丝金属
+        float spec = pow(max(dot(normal, halfDir), 0.0), 32.0);
+
+        // 动态阴影 (Dynamic Shadow)
+        // 梯度越大 (波越陡)，阴影越深
+        float shadow = 1.0 - smoothstep(0.5, 3.0, gradLen);
+
+        // 6. 合成
+        // a. 基础色 + 漫反射 (给颜色加上明暗)
+        vec3 finalColor = baseColor * (0.5 + 0.5 * diff);
+
+        // b. 叠加高光 (只在高亮处叠加纯白色)
+        // 乘以 absVal，确保只有波纹起伏的地方才有高光，平坦处没有
+        finalColor += vec3(1.0) * spec * 0.7 * absVal;
+
+        // c. 应用阴影
+        finalColor *= shadow;
+
+        // 7. 透明度混合
+        // 锐化透明度过渡，让波纹边缘更清晰
+        float opacity = smoothstep(0.02, 0.1, absVal);
+
+        if (isWall) {
+            // 让墙体显示为深灰色金属，并能反射波的光芒
+            float wallShade = max(dot(vec3(0, 0, 1), lightDir), 0.0);
+            color = vec3(0.15) * (0.5 + 0.5 * wallShade) + baseColor * spec * 0.5;
+        }
+        else {
+            color = mix(bg, finalColor, opacity);
         }
     }
 
