@@ -137,8 +137,6 @@ enum class RenderMode {
 enum class EngineType { ACOUSTIC, ELASTIC };
 enum class ElasticVis { DIVERGENCE, CURL, ENERGY }; // 弹性波可视化模式
 
-
-
 // ==========================================
 // 2. Shader 工具函数
 // ==========================================
@@ -1579,6 +1577,8 @@ bool loadModelFromData(AcousticEngine& engine,
     uploadModelToGPU(engine, modelTex, GRID_W, GRID_H);
 
     // 标记更新
+    newW = GRID_W;
+    newH = GRID_H;
     engine.modelModified = true;
 
 
@@ -1933,17 +1933,17 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                     /*static int newW = GRID_W;
                     static int newH = GRID_H;*/
 
-                    newW = GRID_W;
-                    newH = GRID_H;
+                    /*newW = GRID_W;
+                    newH = GRID_H;*/
                     static float newDT = DT;
                     static float newDX = DX;
                     static int newDamp = DAMP_WIDTH;
 
                     // 使用 InputInt 输入框，Slider 可能会在拖动时频繁触发
-                    ImGui::InputInt("Grid Width", &newW, 10, 100);
-                    ImGui::InputInt("Grid Height", &newH, 10, 100);
-                    ImGui::InputFloat("Time Step (dt)", &newDT, 0.00001f, 0.001f, "%.6f");
-                    ImGui::InputFloat("Grid Step (dx)", &newDX, 0.1f, 10.0f);
+                    ImGui::InputInt("Grid Width", &newW, 10, 10000);
+                    ImGui::InputInt("Grid Height", &newH, 10, 10000);
+                    ImGui::InputFloat("Time Step (dt)", &newDT, 0.00001f, 0.01f, "%.6f");
+                    ImGui::InputFloat("Grid Step (dx)", &newDX, 0.1f, 100.0f);
                     ImGui::InputInt("Damp Width", &newDamp);
 
                     // 限制最小尺寸，防止崩溃
@@ -1952,7 +1952,8 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
 
                     if (ImGui::Button(" APPLY RESIZE & RESET ", ImVec2(-1, 40))) {
                         // 1. 更新全局参数
-
+                        //GRID_W=newW;
+                        //GRID_H=newH;
                         DT = newDT;
                         DX = newDX;
                         DAMP_WIDTH = newDamp;

@@ -1,7 +1,3 @@
-以下是整理好的 Markdown 格式文档。你可以直接复制保存为 `ffmpeg_commands.md` 或放入你的笔记软件中。
-
-我已经修正了原指令中多余的空格（例如 `- framerate` 改为 `-framerate`），确保复制到终端即可直接运行。
-
 ***
 
 # FFmpeg 图片序列转视频指令大全
