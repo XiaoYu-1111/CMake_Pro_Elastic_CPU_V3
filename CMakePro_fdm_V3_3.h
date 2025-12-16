@@ -1,10 +1,21 @@
-﻿
+﻿/**
+ * @file    CMakePro_fdm_V3_3.cpp
+ * @author  XIAO YU (1269466423@qq.com)
+ * @brief   Acoustic Wave Propagation Simulation Engine (FDTD Method)
+ * @version 3.3.0
+ * @date    2025-12-16
+ *
+ * @copyright Copyright (c) 2025 [Xiao Yu]. All rights reserved.
+ *
+ * This software is licensed under the MIT License.
+ * See the LICENSE file for more details.
+ */
+ // =================================================================================
 #define NOMINMAX                 // 禁用Windows的min/max宏
-
+#define STB_IMAGE_WRITE_IMPLEMENTATION // 启用写入实现
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include "stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION // 启用写入实现
 #include "stb_image_write.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -30,15 +41,36 @@
 #include <filesystem> // 用于创建文件夹
 namespace fs = std::filesystem;
 
+// 跨平台文件操作
+#include <string.h>
+#ifdef _WIN32
+
+#include <commdlg.h>
+#else
+// Linux headers
+#include <stdio.h>
+#include <stdlib.h>
+#endif
+
+#ifdef _WIN32
+#include <windows.h> // Windows 下使用原生的 strcpy_s
+#else
+#include <string.h>
+// Linux/Mac 下定义一个宏或内联函数来模拟 strcpy_s
+// 参数含义: 目标 buffer, buffer 大小, 源字符串
+inline int strcpy_s(char* dest, size_t size, const char* src) {
+    strncpy(dest, src, size - 1);
+    dest[size - 1] = '\0'; // 确保末尾也是 \0，防止溢出
+    return 0;
+}
+#endif
+
 // ==========================================
 // 1. 核心参数与全局定义
 // ==========================================
 using Real = float;
 const int INITIAL_WINDOW_WIDTH = 1000;
 const int INITIAL_WINDOW_HEIGHT = 1000;
-// ==========================================
-// 1. 核心参数与全局定义 (修改后)
-// ==========================================
 // const int GRID_W = 500;  <-- 删除 const
 // const int GRID_H = 500;  <-- 删除 const
 int GRID_W = 500;
@@ -50,6 +82,9 @@ Real DT = 0.0001f;
 // const int DAMP_WIDTH = 50; <-- 删除 const
 int DAMP_WIDTH = 50;
 
+int newW = GRID_W;
+int newH = GRID_H;
+
 // 其他保持不变...
 const Real PI = 3.1415926535f;
 
@@ -57,6 +92,7 @@ const Real PI = 3.1415926535f;
 bool show_recorder_window = true;
 bool show_recorders_window = false;
 bool SwapInterval = true;
+int stepsPerFrame = 1;
 std::string exe_dir;
 float wetness = 0.5;
 
@@ -1052,8 +1088,8 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         if (key == GLFW_KEY_W) currentRenderMode = RenderMode::HEATMAP;
         if (key == GLFW_KEY_E) currentRenderMode = RenderMode::MODEL;
         if (key == GLFW_KEY_A) currentRenderMode = RenderMode::COOLWARM;
-        if (key == GLFW_KEY_D) currentRenderMode = RenderMode::CUSTOM;
-        if (key == GLFW_KEY_T) {currentRenderMode = static_cast<RenderMode>((static_cast<int>(currentRenderMode) + 1) % 13);};
+        if (key == GLFW_KEY_D) currentRenderMode = RenderMode::Thin_Film;
+        if (key == GLFW_KEY_T) {currentRenderMode = static_cast<RenderMode>((static_cast<int>(currentRenderMode) + 1) % 15);};
 
         if (key == GLFW_KEY_F) engine.toggleFreeSurface();
         if (key == GLFW_KEY_B) engine.toggleBoundary();
@@ -1124,7 +1160,6 @@ std::string saveWavefieldToPNG(int x, int y, int width, int height) {
     }
     return ""; // 【修改】失败返回空
 }
-
 // 重载：保存到指定路径 (用于录制)
 void saveFrameToPath(int x, int y, int width, int height, const std::string& filepath) {
     std::vector<unsigned char> pixels(width * height * 3);
@@ -1170,8 +1205,7 @@ void startRecording() {
 }
 
 //# 在图片文件夹内运行
-//ffmpeg - framerate 60 - i frame_ % 05d.png - c:v libx264 - pix_fmt yuv420p output.mp4
-//ffmpeg - r 60 - i frame_ % 05d.png - c:v libx264 output.mp4
+//ffmpeg - framerate 60 - i frame_ % 05d.png - vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" - c:v av1_nvenc - pix_fmt yuv420p - cq 20 output_av1.mp4
 void stopRecording() {
     isRecording = false;
     std::cout << ">>> Recording Stopped. Total frames: " << recordFrameCount << std::endl;
@@ -1272,6 +1306,26 @@ void Manual_print() {
     std::cout << "-------------------------------------------\n";
 
 }
+//自动配置openmp
+void InitOpenMPRobust(int target) {
+    int maxProcs = omp_get_num_procs();
+
+    // 逻辑：如果核心足够多，就用 target；否则就全用上
+    if (maxProcs >= target) {
+        omp_set_num_threads(target);
+    }
+    else {
+        // 这里的改进是：如果只有 6 核，就用 6 核，而不是降级到 2 核
+        omp_set_num_threads(maxProcs);
+    }
+
+    // 再次检查，防止 maxProcs 返回异常值（极少情况）
+    if (omp_get_max_threads() < 1) omp_set_num_threads(1);
+
+    std::cout << ">>> Auto-configured OpenMP: " << omp_get_max_threads()
+        << " threads (Hardware: " << maxProcs << ")" << std::endl;
+}
+
 // 将此代码放在你的 ImGui 渲染循环中 (例如 RenderUI() 函数内)
 void RenderThreadControl(){
     // 定义一个控制窗口显示的布尔值
@@ -1281,7 +1335,7 @@ void RenderThreadControl(){
     // 1. 触发部分：放在你的主界面、菜单栏或工具栏中
     // ==========================================================
     // 可以在这里点击打开窗口
-    if (ImGui::Button("CPU Settings")) {
+    if (ImGui::Button("CPU Settings", ImVec2(-1, 40))) {
         showThreadConfig = true;
     }
     // ==========================================================
@@ -1527,8 +1581,9 @@ bool loadModelFromData(AcousticEngine& engine,
     // 标记更新
     engine.modelModified = true;
 
+
     // 建议：重置一下震源位置，防止震源跑出新网格的范围
-     engine.addSource(GRID_W / 2,GRID_H / 2);
+    engine.addSource(GRID_W / 2,GRID_H / 2);
 
     std::cout << "[IO] Model loaded successfully!" << std::endl;
     return true;
@@ -1554,6 +1609,51 @@ bool OpenWindowsFileDialog(char* buffer, int bufferSize) {
     return GetOpenFileNameA(&ofn);
 }
 
+
+// 统一的接口函数,适用于win/linux
+bool OpenSystemFileDialog(char* buffer, int bufferSize) {
+    // 清空缓冲区
+    memset(buffer, 0, bufferSize);
+
+#ifdef _WIN32
+    // ================= Windows 实现 =================
+    OPENFILENAMEA ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = bufferSize;
+    ofn.lpstrFilter = "Model Data (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+
+    return GetOpenFileNameA(&ofn);
+
+#else
+    // ================= Linux 实现 (Zenity) =================
+    // 注意：确保 Linux 系统安装了 zenity
+    const char* cmd = "zenity --file-selection --file-filter='*.txt' --title='Select Model Data'";
+    FILE* pipe = popen(cmd, "r");
+    if (!pipe) {
+        std::cerr << "[Error] Zenity not found. Install it via package manager." << std::endl;
+        return false;
+    }
+
+    bool success = false;
+    if (fgets(buffer, bufferSize, pipe) != NULL) {
+        // 去掉末尾的换行符
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n') {
+            buffer[len - 1] = '\0';
+        }
+        success = (strlen(buffer) > 0);
+    }
+
+    pclose(pipe);
+    return success;
+#endif
+}
+
 void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& modelTex)
 {
     static bool showWindow = false;
@@ -1565,8 +1665,7 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
 
     // 状态提示
     static std::string statusMsg = "";
-
-    if (ImGui::Button("Import Model (Win32)")) {
+    if (ImGui::Button("Import Model (Win32)",ImVec2(-1, 40))) {
         showWindow = true;
     }
 
@@ -1577,7 +1676,6 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
             ImGui::Text("Load Vp and Density files (.txt)");
             ImGui::Separator();
             ImGui::Spacing();
-
             // ---------------------------------------------------------
             // 1. 选择纵波文件 (Vp)
             // ---------------------------------------------------------
@@ -1591,12 +1689,11 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
                 // 创建一个临时 buffer 或者是直接清空 vpPath
                 // 这里我们直接传入 vpPath，如果用户取消选择，内容不会变（取决于实现，最安全是先清空）
                 char tempBuffer[1024] = "";
-                if (OpenWindowsFileDialog(tempBuffer, 1024)) {
+                if (OpenSystemFileDialog(tempBuffer, 1024)) {
                     // 如果选中了文件，更新路径
                     strcpy_s(vpPath, tempBuffer);
                 }
             }
-
             ImGui::Spacing();
 
             // ---------------------------------------------------------
@@ -1608,7 +1705,7 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
 
             if (ImGui::Button("Browse##2")) {
                 char tempBuffer[1024] = "";
-                if (OpenWindowsFileDialog(tempBuffer, 1024)) {
+                if (OpenSystemFileDialog(tempBuffer, 1024)) {
                     strcpy_s(rhoPath, tempBuffer);
                 }
             }
@@ -1647,7 +1744,7 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
     }
 }
 
-void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fieldTex, GLuint modelTex) {
+void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint modelTex) {
 
     // 渲染流程
     int winW, winH; glfwGetWindowSize(window, &winW, &winH);
@@ -1801,7 +1898,6 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                 if (ImGui::BeginTabItem(" Settings ")) {
                     ImGui::Spacing();
                     ImGui::TextColored(ImVec4(0, 1, 1, 1), "Physics Engine");
-
                     // 引擎切换
                     int engIdx = (int)engine.engineType;
                     if (ImGui::Combo("Mode", &engIdx, "Acoustic (P-Wave)\0Elastic (P+S Wave)\0")) {
@@ -1834,8 +1930,11 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                     ImGui::Separator();
                     ImGui::Text("Grid Resize");
                     //            // --- 【新增】网格与参数动态修改 ---
-                    static int newW = GRID_W;
-                    static int newH = GRID_H;
+                    /*static int newW = GRID_W;
+                    static int newH = GRID_H;*/
+
+                    newW = GRID_W;
+                    newH = GRID_H;
                     static float newDT = DT;
                     static float newDX = DX;
                     static int newDamp = DAMP_WIDTH;
@@ -1853,6 +1952,7 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
 
                     if (ImGui::Button(" APPLY RESIZE & RESET ", ImVec2(-1, 40))) {
                         // 1. 更新全局参数
+
                         DT = newDT;
                         DX = newDX;
                         DAMP_WIDTH = newDamp;
@@ -1865,6 +1965,7 @@ void Render_Imgui(GLFWwindow* window, int frames, int stepsPerFrame, GLuint fiel
                         // 4. 强制标记模型更新，以便将新材质上传到 GPU
                         engine.modelModified = true;
                     }
+                    
 
                     RenderThreadControl();
 
@@ -2420,15 +2521,9 @@ int main() {
 
     //手册输出
     Manual_print();
+    //初始化线程数
+    InitOpenMPRobust(2);
 
-
-    std::cout << "Detected CPU Threads: " << omp_get_max_threads() << std::endl;
-    std::cout << ">>> OpenMP Enabled." << std::endl;
-    static int threadCount = omp_get_max_threads(); // 默认设为最大值
-    // 设置接下来使用 8 个线程
-    omp_set_num_threads(8);
-
-    int stepsPerFrame = 1;
     auto lastT = std::chrono::high_resolution_clock::now();
     int frames = 0;
     //main loop
@@ -2503,7 +2598,7 @@ int main() {
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         //------------------------------imgui_render----------------------------------
         //Render_gui绘制步骤
-        Render_Imgui(window, frames, stepsPerFrame,fieldTex, modelTex);
+        Render_Imgui(window, frames,fieldTex, modelTex);
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
