@@ -23,6 +23,7 @@
 
 #include <windows.h>
 #include <vector>
+#include <deque> // 双端列表
 #include <cmath>
 #include <iostream>
 #include <algorithm>
@@ -95,7 +96,7 @@ bool SwapInterval = true;
 int stepsPerFrame = 1;
 std::string exe_dir;
 float wetness = 0.5;
-
+//截图相关
 bool triggerScreenshot = false;
 // --- 截图提示相关 ---
 std::string lastSavedPath = "";   // 保存最后一次截图的完整路径
@@ -250,28 +251,88 @@ public:
     bool enableFreeSurface = false;
     int currentFreq = 100;
 
-    // 单点记录器
+    //single recorder
     struct Recorder {
-        int gx, gy;
-        std::vector<float> history;
-        int maxHistory = 1000;
+        int gx = 0;
+        int gy = 0;
+        std::deque<float> history; // 改用 deque
+        int maxHistory = 1000;  // 类型改为 size_t 更规范
+
         void update(const std::vector<Real>& field, int width) {
             if (gx < 0 || gx >= width) return;
+
+            // 增加对 gy 的边界检查，防止 gy 为负数或过大导致 idx 越界
             int idx = gy * width + gx;
             if (idx >= 0 && idx < (int)field.size()) {
                 history.push_back(field[idx]);
-                if (history.size() > maxHistory) history.erase(history.begin());
+                if (history.size() > maxHistory) {
+                    history.pop_front(); // deque 的头部删除操作是 O(1) 的，极快
+                }
             }
         }
     } recorder;
 
-    // 阵列接收器
+    // 检波器阵列
     struct Receiver {
-        int gx, gy; std::vector<float> data;
-        Receiver(int x, int y, int capacity) : gx(x), gy(y) { data.reserve(capacity); }
+        int gx, gy;
+        std::vector<float> data;
+        int writeHead = 0; // 当前写入位置的索引
+        int capacity = 0;  // 最大历史长度
+
+        Receiver(int x, int y, int maxLen) : gx(x), gy(y), capacity(maxLen) {
+            data.resize(maxLen, 0.0f); // 预先分配内存并填零
+            writeHead = 0;
+        }
+
+        // 辅助函数：重置
+        void reset() {
+            std::fill(data.begin(), data.end(), 0.0f);
+            writeHead = 0;
+        }
     };
     std::vector<Receiver> receivers;
     int maxHistoryLen = 1000;
+    // ...
+    void placeArray(int x1, int y1, int x2, int y2, int count) {
+        receivers.clear();
+        if (count < 1) count = 1;
+
+        for (int i = 0; i < count; ++i) {
+            // 1. 计算插值 t (0.0 到 1.0)
+            float t = (count == 1) ? 0.0f : (float)i / (count - 1);
+
+            // 2. 使用四舍五入计算坐标，比直接截断更平滑
+            int cx = std::round(x1 + (x2 - x1) * t);
+            int cy = std::round(y1 + (y2 - y1) * t);
+
+            // 3. 使用 std::clamp 限制边界 (C++17)
+            // 确保不放在最外圈的边界上（假设通常边界是墙壁或PML）
+            cx = std::clamp(cx, 2, GRID_W - 3);
+            cy = std::clamp(cy, 2, GRID_H - 3);
+
+            receivers.emplace_back(cx, cy, maxHistoryLen);
+        }
+    }
+
+    void updateReceivers() {
+        for (auto& r : receivers) {
+            // 边界安全检查 (可选，但在调试阶段很有用)
+            if (r.gx < 0 || r.gx >= GRID_W || r.gy < 0 || r.gy >= GRID_H) continue;
+
+            int idx = r.gy * GRID_W + r.gx;
+
+            // 4. 环形缓冲区写入 (O(1) 复杂度)
+            // 直接覆盖当前位置，然后指针后移
+            r.data[r.writeHead] = p[idx];
+            r.writeHead = (r.writeHead + 1) % r.data.size();
+        }
+    }
+
+    void clearReceiversData() {
+        for (auto& r : receivers) {
+            r.reset();
+        }
+    }
 
     AcousticEngine() {
         size_t size = GRID_W * GRID_H;
@@ -287,29 +348,6 @@ public:
         initDamping();
         recorder.gx = GRID_W / 2; recorder.gy = GRID_H / 2; recorder.maxHistory = 1000;
     }
-
-    void placeArray(int x1, int y1, int x2, int y2, int count) {
-        receivers.clear();
-        if (count < 1) count = 1;
-        for (int i = 0; i < count; ++i) {
-            float t = (count == 1) ? 0.0f : (float)i / (count - 1);
-            int cx = (int)(x1 + (x2 - x1) * t);
-            int cy = (int)(y1 + (y2 - y1) * t);
-            cx = std::max(2, std::min(GRID_W - 3, cx));
-            cy = std::max(2, std::min(GRID_H - 3, cy));
-            receivers.emplace_back(cx, cy, maxHistoryLen);
-        }
-    }
-
-    void updateReceivers() {
-        for (auto& r : receivers) {
-            int idx = r.gy * GRID_W + r.gx;
-            r.data.push_back(p[idx]);
-            if (r.data.size() > maxHistoryLen) r.data.erase(r.data.begin());
-        }
-    }
-
-    void clearReceiversData() { for (auto& r : receivers) r.data.clear(); }
 
     void initMaterial() {
 #pragma omp parallel for
@@ -1271,6 +1309,52 @@ void Init_Imgui(GLFWwindow* window) {
 
 }
 
+// 定义一个 Getter 函数，用来从 deque 中取值
+float ValueGetter(void* data, int idx) {
+    const auto& dequeRef = *(const std::deque<float>*)data;
+    return dequeRef[idx];
+}
+
+// ---------------------------------------------------------
+// Helper: Seismic Color Mappings
+// ---------------------------------------------------------
+
+// Mode 2: Red-White-Blue (Seismic Polarity)
+static ImU32 GetSeismicColor(float val, float maxVal) {
+    float t = val / maxVal;
+    if (t > 1.0f) t = 1.0f;
+    if (t < -1.0f) t = -1.0f;
+
+    // Background neutral color (matches deep UI background)
+    ImVec4 colCenter(0.4f, 0.4f, 0.45f, 1.0f);
+    ImVec4 colPos(1.0f, 0.2f, 0.2f, 1.0f);  // Positive: Soft Red
+    ImVec4 colNeg(0.2f, 0.6f, 1.0f, 1.0f);  // Negative: Soft Blue
+
+    ImVec4 res;
+    if (t > 0) {
+        res.x = colCenter.x + (colPos.x - colCenter.x) * t;
+        res.y = colCenter.y + (colPos.y - colCenter.y) * t;
+        res.z = colCenter.z + (colPos.z - colCenter.z) * t;
+        res.w = 1.0f;
+    }
+    else {
+        t = -t;
+        res.x = colCenter.x + (colNeg.x - colCenter.x) * t;
+        res.y = colCenter.y + (colNeg.y - colCenter.y) * t;
+        res.z = colCenter.z + (colNeg.z - colCenter.z) * t;
+        res.w = 1.0f;
+    }
+    return ImGui::ColorConvertFloat4ToU32(res);
+}
+
+// Mode 3: Rainbow/Jet (Energy)
+static ImU32 GetRainbowColor(float val, float maxVal) {
+    float t = std::abs(val) / maxVal;
+    if (t > 1.0f) t = 1.0f;
+    // Map 0.0->1.0 to Hue 0.66(Blue)->0.0(Red)
+    return ImColor::HSV((1.0f - t) * 0.66f, 0.85f, 0.9f);
+}
+
 void Manual_print() {
     // 控制台操作手册
     std::cout << "=== Acoustic Wave Pro (Console Version) ===\n";
@@ -1744,6 +1828,7 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
     }
 }
 
+
 void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint modelTex) {
 
     // 渲染流程
@@ -2146,7 +2231,19 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                 ImGui::Begin("Oscilloscope", &show_recorder_window);
                 ImGui::SliderInt("History Len", &engine.recorder.maxHistory, 100, 2000);
                 if (engine.recorder.history.size() > 0) {
-                    ImGui::PlotLines("##W", engine.recorder.history.data(), (int)engine.recorder.history.size(), 0, NULL, -5000.0f, 5000.0f, ImVec2(-1, 140));
+                    //ImGui::PlotLines("##W", engine.recorder.history.data(), (int)engine.recorder.history.size(), 0, NULL, -5000.0f, 5000.0f, ImVec2(-1, 140));
+                    ImGui::PlotLines(
+                        "##W",
+                        ValueGetter,
+                        (void*)&engine.recorder.history, // 传入 deque 的指针作为 user_data
+                        (int)engine.recorder.history.size(),
+                        0,
+                        NULL,
+                        -5000.0f,
+                        5000.0f,
+                        ImVec2(-1, 140)
+                    );
+                
                 }
                 ImGui::Text("Probe: (%d, %d)", engine.recorder.gx, engine.recorder.gy);
                 ImGui::End();
@@ -2205,6 +2302,25 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                     if (ImGui::Button(" Reset_Gain ", ImVec2(btnW, 35))) { waveGain = 0.05f; };
                     ImGui::Separator(); // 画一条分割线
 
+                    // 1. 定义变量 (使用 static 确保它在函数退出后保存值，或者把它放到你的类成员里)
+                    static int show_type = 1;
+                    // 2. 添加标题或说明 (可选)
+                    ImGui::Spacing();
+                    ImGui::Text("Visualization Style:");
+
+                    // 3. 绘制整数滑条
+                    // 参数说明: 标签, 变量指针, 最小值, 最大值, 显示格式
+                    // 这里假设你有两种模式：0 (普通线), 1 (热力图)
+                    ImGui::SliderInt("Mode", &show_type, 0, 1, "Type: %d");
+                    // 4. 添加鼠标悬停提示 (强烈建议添加，否则用户不知道 0 和 1 代表什么)
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Mode 0: Wiggle Trace (Black Line)\n"
+                            "Mode 1: Heatmap (Red-Blue Color)"
+                        );
+                    }
+                    ImGui::Separator(); // 再画一条分割线，区分下面的绘图区域
+
                     // --- 2. 画布区域计算 ---
                     ImDrawList* draw_list = ImGui::GetWindowDrawList();
                     ImVec2 canvas_pos = ImGui::GetCursorScreenPos(); // 获取滑块下方的起始位置
@@ -2232,7 +2348,6 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                             IM_COL32(60, 60, 70, 80)
                         );
                     }
-
                     // --- 4. 核心波形绘制逻辑 ---
 
                     // 定义左右边距 (Padding)
@@ -2265,30 +2380,110 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                             ImVec2(basePathX, canvas_pos.y + canvas_size.y),
                             centerLineColor
                         );
+                        // 计算起始索引：最旧的数据在 writeHead 处 (因为它马上要被覆盖)
+                        // 注意：如果数据还没填满，逻辑稍微不同，但这里假设已经填满或无所谓
 
-                        // 绘制波形 (Wiggle Trace)
-                        // 优化：步长设为2，减少一半的绘制点数，提高性能
-                        for (size_t t = 0; t < r.data.size() - 1; t += 1) {
-                            float y1 = canvas_pos.y + t * timeStepHeight;
-                            float y2 = canvas_pos.y + (t + 1) * timeStepHeight;
+                        int startIdx = r.writeHead;
+                        int size = (int)r.data.size();
+                        //基础版本
+                        if (show_type == 0) {
+                            for (int i = 0; i < size - 1; ++i) {
+                                // 计算真实的物理索引 (环形映射)
+                                int idx1 = (startIdx + i) % size;
+                                int idx2 = (startIdx + i + 1) % size;
 
-                            // 振幅限制：防止单一波形过大覆盖了整个屏幕
-                            // 这里的 0.05f 是振幅缩放系数，可以根据需要微调
-                            float val1 = r.data[t] * waveGain * 0.15f;
-                            float val2 = r.data[t + 1] * waveGain * 0.15f;
+                                // t 代表时间步 (用于画Y轴位置)
+                                float t = (float)i;
 
-                            // 简单的钳制，防止画太远
-                            float maxDeviation = colWidth * 2.0f; // 允许波形稍微重叠，但不允许飞太远
-                            if (val1 > maxDeviation) val1 = maxDeviation;
-                            if (val1 < -maxDeviation) val1 = -maxDeviation;
-                            if (val2 > maxDeviation) val2 = maxDeviation;
-                            if (val2 < -maxDeviation) val2 = -maxDeviation;
+                                float y1 = canvas_pos.y + t * timeStepHeight;
+                                float y2 = canvas_pos.y + (t + 1) * timeStepHeight;
 
-                            float x1 = basePathX + val1;
-                            float x2 = basePathX + val2;
+                                // 取数据
+                                float val1 = r.data[idx1] * waveGain * 0.15f;
+                                float val2 = r.data[idx2] * waveGain * 0.15f;
 
-                            if (y1 < canvas_pos.y + canvas_size.y) {
-                                draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.5f); // 线条稍微加粗一点点 (1.5f)
+                                // 简单的钳制，防止画太远
+                                float maxDeviation = colWidth * 2.0f; // 允许波形稍微重叠，但不允许飞太远
+                                if (val1 > maxDeviation) val1 = maxDeviation;
+                                if (val1 < -maxDeviation) val1 = -maxDeviation;
+                                if (val2 > maxDeviation) val2 = maxDeviation;
+                                if (val2 < -maxDeviation) val2 = -maxDeviation;
+
+                                float x1 = basePathX + val1;
+                                float x2 = basePathX + val2;
+
+                                if (y1 < canvas_pos.y + canvas_size.y) {
+                                    draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), waveColor, 1.5f); // 线条稍微加粗一点点 (1.5f)
+                                }
+                            }
+                        }
+
+                        else if (show_type == 1) {
+                            // --- 修复版：宽过渡带 平滑色标 ---
+                            auto GetSmoothColor = [](float val, float maxVal) -> ImU32 {
+                                // 1. 归一化
+                                float t = val / maxVal;
+
+                                // 2. 移除之前的 pow(0.7) 增强，改回线性或者更平缓的曲线
+                                // 钳制范围 [-1, 1]
+                                if (t > 1.0f) t = 1.0f;
+                                if (t < -1.0f) t = -1.0f;
+
+                                // 3. 定义颜色节点
+                                // 既然背景是深色(20,20,25)，中心颜色设为深灰色，能让线条一直可见，且过渡更柔和
+                                ImVec4 colCenter(0.4f, 0.4f, 0.45f, 1.0f); // 中性灰 (静默)
+                                ImVec4 colPos(1.0f, 0.2f, 0.2f, 1.0f);  // 正值: 柔和红
+                                ImVec4 colNeg(0.2f, 0.6f, 1.0f, 1.0f);  // 负值: 柔和蓝
+                                ImVec4 result;
+                                if (t > 0) {
+                                    // 正值区间：从 灰 -> 红
+                                    // 简单的线性插值 (Linear Interpolation) 保证过渡最宽
+                                    result.x = colCenter.x + (colPos.x - colCenter.x) * t;
+                                    result.y = colCenter.y + (colPos.y - colCenter.y) * t;
+                                    result.z = colCenter.z + (colPos.z - colCenter.z) * t;
+                                    result.w = 1.0f;
+                                }
+                                else {
+                                    // 负值区间：从 灰 -> 蓝
+                                    t = -t; // 取绝对值
+                                    result.x = colCenter.x + (colNeg.x - colCenter.x) * t;
+                                    result.y = colCenter.y + (colNeg.y - colCenter.y) * t;
+                                    result.z = colCenter.z + (colNeg.z - colCenter.z) * t;
+                                    result.w = 1.0f;
+                                }
+
+                                return ImGui::ColorConvertFloat4ToU32(result);
+                                };
+
+                            // --- 关键修改：扩大动态范围 ---
+                            // 之前是 5.0f，现在改为 20.0f 或更大。
+                            // 值越大，颜色从灰色变成纯红/纯蓝所需的振幅就越大，过渡带就越宽。
+                            float colorMaxAmp = 20.0f / waveGain;
+
+                            for (int i = 0; i < size - 1; ++i) {
+                                // ... (索引计算保持不变) ...
+                                int idx1 = (startIdx + i) % size;
+                                int idx2 = (startIdx + i + 1) % size;
+                                float t = (float)i;
+
+                                float y1 = canvas_pos.y + t * timeStepHeight;
+                                float y2 = canvas_pos.y + (t + 1) * timeStepHeight;
+
+                                // ... (振幅钳制保持不变) ...
+                                float val1 = r.data[idx1] * waveGain * 0.15f;
+                                float val2 = r.data[idx2] * waveGain * 0.15f;
+
+                                // ... (x1, x2 计算保持不变) ...
+                                float x1 = basePathX + val1;
+                                float x2 = basePathX + val2;
+
+                                if (y1 < canvas_pos.y + canvas_size.y) {
+                                    // 使用线段中点的值来计算颜色，这样渐变比取最大值更细腻
+                                    float avgV = (r.data[idx1] + r.data[idx2]) * 0.5f;
+
+                                    ImU32 segColor = GetSmoothColor(avgV, colorMaxAmp);
+                                    draw_list->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), segColor, 2.0f);
+                                }
                             }
                         }
 
@@ -2298,10 +2493,8 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                         float textWidth = ImGui::CalcTextSize(label).x;
                         draw_list->AddText(ImVec2(basePathX - textWidth * 0.5f, canvas_pos.y + 5), IM_COL32(200, 200, 200, 255), label);
                     }
-
                     // 绘制外边框
                     draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(100, 100, 100, 255));
-
                     // 结束裁剪
                     draw_list->PopClipRect();
                 }
@@ -2393,6 +2586,7 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                         fg_list->AddCircleFilled(ImVec2(tx, ty), 3.0f, colPreview);
                     }
 
+
                     // 绘制起点和终点的十字准星，辅助对齐
                     fg_list->AddLine(ImVec2(startPx - 5, startPy), ImVec2(startPx + 5, startPy), colPreview);
                     fg_list->AddLine(ImVec2(startPx, startPy - 5), ImVec2(startPx, startPy + 5), colPreview);
@@ -2400,8 +2594,8 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
                     fg_list->AddLine(ImVec2(endPx, endPy - 5), ImVec2(endPx, endPy + 5), colPreview);
                 }
                 // ==========================================
-    // 新增: 3. 绘制波场刻度尺 (Rulers)
-    // ==========================================
+                // 新增: 3. 绘制波场刻度尺 (Rulers)
+                // ==========================================
                 {
                     const int rulerStep = 50;       // 刻度间隔
                     const float tickLen = 6.0f;     // 刻度线长度
@@ -2462,6 +2656,7 @@ void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint model
             }
         }
     }
+    
 // ==========================================
 // 6. 主程序入口
 // ==========================================
@@ -2475,7 +2670,7 @@ int main() {
     if (!window) return -1;
 
     GLFWimage images[1];
-    std::string image_icon = "../resources/images/icon.png";
+    std::string image_icon = "../resources/images/icon_main.png";
     images[0].pixels = stbi_load(image_icon.c_str(), &images[0].width, &images[0].height, 0, 4);
     if (images[0].pixels) { glfwSetWindowIcon(window, 1, images); stbi_image_free(images[0].pixels); }
 
@@ -2612,12 +2807,12 @@ int main() {
             frames = 0; lastT = now;
         }
     }
-
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+
     glfwTerminate();
     switchToChineseInput();
 
     return 0;
-}
+ }
