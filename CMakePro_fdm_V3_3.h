@@ -1,5 +1,5 @@
 ﻿/**
- * @file    CMakePro_fdm_V3_3.cpp
+ * @file    Wave_GPU_comp
  * @author  XIAO YU (1269466423@qq.com)
  * @brief   Acoustic Wave Propagation Simulation Engine (FDTD Method)
  * @version 3.3.0
@@ -1827,7 +1827,6 @@ void RenderNativeLoadPanel(AcousticEngine& engine, GLuint& fieldTex, GLuint& mod
         }
     }
 }
-
 
 void Render_Imgui(GLFWwindow* window, int frames,  GLuint fieldTex, GLuint modelTex) {
 
