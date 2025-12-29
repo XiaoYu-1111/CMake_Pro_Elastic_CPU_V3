@@ -1247,6 +1247,8 @@ void stopRecording() {
     std::cout << ">>> Recording Stopped. Total frames: " << recordFrameCount << std::endl;
     // 这里可以提示用户如何使用 FFmpeg 合成
 }
+
+
 // 放在 main 函数内部，或者作为独立函数
 void resizeGLTextures(GLuint fieldTex, GLuint modelTex, int w, int h) {
     glBindTexture(GL_TEXTURE_2D, fieldTex);
