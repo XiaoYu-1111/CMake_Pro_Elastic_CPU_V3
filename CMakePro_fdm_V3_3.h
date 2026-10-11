@@ -1049,7 +1049,7 @@ ViewportInfo getViewport(int winW, int winH) {
     vp.scaleX = (float)vp.w / GRID_W; vp.scaleY = (float)vp.h / GRID_H;
     return vp;
 }
-
+//
 void process_input(GLFWwindow* window) {
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantCaptureMouse) {
@@ -1247,7 +1247,6 @@ void stopRecording() {
     std::cout << ">>> Recording Stopped. Total frames: " << recordFrameCount << std::endl;
     // 这里可以提示用户如何使用 FFmpeg 合成
 }
-
 
 // 放在 main 函数内部，或者作为独立函数
 void resizeGLTextures(GLuint fieldTex, GLuint modelTex, int w, int h) {
@@ -1694,7 +1693,6 @@ bool OpenWindowsFileDialog(char* buffer, int bufferSize) {
     // 如果用户点击了“打开”，返回 true
     return GetOpenFileNameA(&ofn);
 }
-
 
 // 统一的接口函数,适用于win/linux
 bool OpenSystemFileDialog(char* buffer, int bufferSize) {

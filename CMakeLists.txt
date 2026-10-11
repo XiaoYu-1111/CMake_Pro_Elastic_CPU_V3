@@ -14,7 +14,6 @@ set(TARGET_NAME "CMakePro_wave_V3")
 # ==========================================
 set(LIB_ROOT "D:/CPP_lib")
 set(OPENGL_ROOT "${LIB_ROOT}/OpenGL")
-set(SDL2_ROOT   "${LIB_ROOT}/SDL2/SDL2-devel-2.30.9-VC/SDL2-2.30.9")
 
 # ==========================================
 # 3. 收集源文件
@@ -110,7 +109,6 @@ target_include_directories(${TARGET_NAME} PRIVATE
     "${OPENGL_ROOT}/glm-master/glm-master"
     "${OPENGL_ROOT}/glew-2.1.0-win32/glew-2.1.0/include"
     "${OPENGL_ROOT}/glfw-3.4.bin.WIN64/glfw-3.4.bin.WIN64/include"
-    "${SDL2_ROOT}/include"
 )
 
 # ==========================================
@@ -135,10 +133,6 @@ target_link_libraries(${TARGET_NAME} PRIVATE
     opengl32.lib
     user32.lib
     
-    # SDL2 库
-    SDL2.lib
-    SDL2_image.lib
-    SDL2_mixer.lib
 )
 
 # (可选) 在 VS 中将源文件分组显示，方便查看
